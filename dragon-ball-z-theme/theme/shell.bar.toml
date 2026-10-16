@@ -1,0 +1,10 @@
+[bar]
+background       = "#171310"
+background-alpha = 0.62
+text             = "#ede4d6"
+# Modules demanding attention (recording, updates, alerts) stay red -- that is
+# a semantic state, not a brand colour.
+active           = "#e8503c"
+scale-with-font  = true
+size-horizontal  = 30
+size-vertical    = 32

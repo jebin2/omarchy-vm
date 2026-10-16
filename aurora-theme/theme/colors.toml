@@ -1,0 +1,39 @@
+# Aurora — deep midnight with teal/violet aurora accents.
+# Single source of truth: Omarchy generates foot, ghostty, alacritty, kitty,
+# btop, neovim, helix, chromium, vscode, obsidian and the shell palette from this.
+mode = "dark"
+
+accent    = "#7dcfff"
+selection = "#252c47"
+muted     = "#3a4260"
+
+background         = "#0d0f1a"
+dark_background    = "#090b14"
+darker_background  = "#06080f"
+lighter_background = "#161a2b"
+
+foreground        = "#c8d3f5"
+dark_foreground   = "#5a6591"
+light_foreground  = "#a8b3d8"
+bright_foreground = "#e6ecff"
+
+red     = "#ff6b81"
+yellow  = "#ffd479"
+orange  = "#ffb86c"
+green   = "#56e0b0"
+cyan    = "#7dcfff"
+blue    = "#6f9cff"
+magenta = "#bb9af7"
+brown   = "#8a6a4f"
+
+bright_red     = "#ff8b9c"
+bright_yellow  = "#ffe29a"
+bright_green   = "#79ecc4"
+bright_cyan    = "#9fdcff"
+bright_blue    = "#8fb3ff"
+bright_magenta = "#d0b4ff"
+
+# Consumed by hyprland.lua.tpl and shell.toml.tpl so window borders, popups,
+# notifications, the launcher and the lock input all share one gradient.
+hyprland_active_border   = "#7dcfff #bb9af7 45deg"
+hyprland_inactive_border = "rgba(1a1f3399)"

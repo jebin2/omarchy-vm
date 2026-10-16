@@ -1,0 +1,11 @@
+# Downloaded installer and VM state
+*.iso
+/images/
+
+# Local logs and dated backups
+*.log
+*.bak
+*.bak-*
+
+# Editor and OS files
+.DS_Store

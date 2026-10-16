@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# Runs INSIDE the Omarchy guest. Keeps the XWayland and Wayland clipboards in sync.
+# spice-vdagent only speaks X11, so host<->guest clipboard data lands in the
+# XWayland CLIPBOARD selection; Hyprland does not reliably mirror that to Wayland.
+# Text only. Each direction compares contents first, so the two loops don't
+# ping-pong.
+set -u
+
+x_get()  { timeout 3 xclip -o -selection clipboard 2>/dev/null; }
+wl_get() { timeout 3 wl-paste -n -t text 2>/dev/null; }
+
+# X -> Wayland: clipnotify blocks until the X CLIPBOARD owner changes.
+x_to_wl() {
+  while clipnotify -s clipboard; do
+    t="$(x_get)" || continue
+    [ -n "$t" ] && [ "$t" != "$(wl_get)" ] && printf '%s' "$t" | wl-copy >/dev/null 2>&1
+  done
+}
+
+# Wayland -> X: wl-paste runs the handler on every Wayland selection change.
+wl_to_x() {
+  wl-paste -t text --watch bash -c '
+    t="$(cat)"
+    [ -n "$t" ] || exit 0
+    [ "$t" = "$(timeout 3 xclip -o -selection clipboard 2>/dev/null)" ] && exit 0
+    printf "%s" "$t" | xclip -selection clipboard -i >/dev/null 2>&1'
+}
+
+x_to_wl &
+wl_to_x &
+wait -n
+exit 1
