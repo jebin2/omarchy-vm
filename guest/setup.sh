@@ -74,7 +74,10 @@ if [ -f "$LOOKNFEEL" ]; then
     say "Enabling software cursor plane workaround..."
     printf '\n-- QEMU virtio-gpu cursor plane workaround for SPICE.\nhl.config({ cursor = { no_hardware_cursors = true } })\n' >> "$LOOKNFEEL"
   fi
-  hyprctl reload >/dev/null 2>&1 || true
+  # Over SSH there is no HYPRLAND_INSTANCE_SIGNATURE; find the running instance.
+  # Empty when nobody is logged in yet; the next login loads the fix anyway.
+  sig="${HYPRLAND_INSTANCE_SIGNATURE:-$(ls -t "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/hypr" 2>/dev/null | head -1 || true)}"
+  [ -z "$sig" ] || HYPRLAND_INSTANCE_SIGNATURE="$sig" hyprctl reload >/dev/null 2>&1 || true
 fi
 
 # Unencrypted installs stop at the SDDM login screen; inside a VM window that is
@@ -83,6 +86,11 @@ if [ "${OMARCHY_VM_UNATTENDED:-}" = "1" ] && [ ! -f /etc/sddm.conf.d/autologin.c
   say "Enabling desktop autologin..."
   printf '[Autologin]\nUser=%s\nSession=omarchy.desktop\n' "$USER" \
     | sudo install -Dm644 /dev/stdin /etc/sddm.conf.d/autologin.conf
+fi
+
+# omarchy update just ran the migrations its login toast offers; drop the stale toast.
+if [ "${OMARCHY_VM_UNATTENDED:-}" = "1" ] && command -v omarchy-notification-dismiss >/dev/null 2>&1; then
+  omarchy-notification-dismiss "Pending Omarchy Migrations" >/dev/null 2>&1 || true
 fi
 
 # Notify host provisioner

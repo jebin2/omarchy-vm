@@ -13,7 +13,7 @@ git clone https://github.com/jebin2/omarchy-vm.git ~/omarchy-vm
 ~/omarchy-vm/omarchy install
 ```
 
-Choose a username and password when asked, and that's all the input it needs. It installs any missing host packages (this may ask for your sudo password once), downloads the latest Omarchy ISO, installs it hands-free, sets it up, and opens it fullscreen on your desktop.
+Choose a username and password when asked, and that's all the input it needs. It installs any missing host packages (this may ask for your sudo password once), downloads the latest Omarchy ISO, then installs and sets it up in the background, with progress shown in your terminal. When everything is ready, Omarchy opens fullscreen on your desktop.
 
 After that, `omarchy open` and `omarchy stop` work from anywhere.
 
@@ -33,7 +33,7 @@ After that, `omarchy open` and `omarchy stop` work from anywhere.
 | `omarchy reset [ISO]` | Erase the VM and install Omarchy again from scratch |
 | `omarchy delete` | Erase the VM completely (disk, firmware state, app launcher entry). The `omarchy` command and downloaded ISOs are kept |
 
-`reset` and `delete` ask before erasing anything; `-y` skips the prompt. `install --manual` uses the interactive Omarchy installer instead of the hands-free one. `OMARCHY_ENCRYPT=1 omarchy install` creates an encrypted disk, which you unlock in the VM window at each boot.
+`reset` and `delete` ask before erasing anything; `-y` skips the prompt. `install --manual` uses the interactive Omarchy installer instead of the hands-free one. `OMARCHY_ENCRYPT=1 omarchy install` creates an encrypted disk, which you unlock in the VM window at each boot; that window opens right away.
 
 After the first install, `omarchy` is on your `PATH` (`~/.local/bin/omarchy`), and **"Omarchy VM"** shows up in your app launcher. On an Omarchy host, which has its own `omarchy` command, the shortcut is skipped; run `~/omarchy-vm/omarchy` instead.
 
@@ -46,7 +46,7 @@ SSH into the guest: `ssh -p 2222 <user>@127.0.0.1` (your host key is already aut
 - Creates a 40 GB sparse disk (`images/omarchy.qcow2`) and defines the `omarchy-vm` domain.
 - **Installs Omarchy unattended** through the ISO's built-in autoinstall. The installer answers ride on a small `CIDATA`-labeled drive, the same mechanism Omarchy uses for headless installs, and the installer authorizes your host SSH key.
 - **Provisions the guest over SSH**: `omarchy update -y`, guest tools (`qemu-guest-agent`, `spice-vdagent`, `wl-clipboard`, `xclip`, `clipnotify`), the clipboard bridge, the SPICE cursor fix and desktop autologin.
-- Reboots the guest and fits its screen to your monitor.
+- Applies it all to the running desktop (no reboot) and fits the screen to your monitor.
 
 Sudo inside the guest uses a temporary passwordless grant. It is revoked when setup finishes and expires on its own after an hour. The installer drive holds a hash of your password and is deleted once the install completes. If the hands-free path stops partway, `install` falls back to the manual steps: run `bash <(curl -fsSL http://10.0.2.2:8765)` in a guest terminal.
 

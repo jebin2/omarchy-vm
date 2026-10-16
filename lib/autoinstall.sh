@@ -167,13 +167,21 @@ auto_ssh_ready() {
 auto_install_and_provision() {
   local deadline=$(( $(date +%s) + PROVISION_TIMEOUT ))
 
-  echo -e "\n${BOLD}${GREEN}Installing Omarchy automatically — no input needed in the VM window.${NC}"
-  [ "$AUTO_ENCRYPT" = "1" ] && echo -e "${YELLOW}Encrypted disk: type your password in the VM window when it asks to unlock.${NC}"
-  say "Waiting for the installed system to come up (install takes ~10-20 min)..."
+  local start ticks=0
+  start=$(date +%s)
+  if [ "$AUTO_ENCRYPT" = "1" ]; then
+    echo -e "\n${BOLD}${GREEN}Installing Omarchy automatically.${NC}"
+    echo -e "${YELLOW}Encrypted disk: type your password in the VM window when it asks to unlock.${NC}"
+  else
+    echo -e "\n${BOLD}${GREEN}Installing Omarchy in the background — its window opens when everything is ready.${NC}"
+  fi
+  say "Installing (usually 5-15 min)..."
   until auto_ssh_ready; do
     [ "$(date +%s)" -lt "$deadline" ] || { warn "Timed out waiting for the installed system."; return 1; }
     vm_is_running || { warn "VM stopped before the install finished."; return 1; }
     sleep 5
+    ticks=$((ticks + 1))
+    (( ticks % 12 )) || say "Still installing... ($(( ($(date +%s) - start) / 60 )) min)"
   done
   ok "Omarchy installed and reachable over SSH."
 
@@ -197,17 +205,16 @@ auto_install_and_provision() {
   local rc=0
   vm_guest_ssh "OMARCHY_VM_UNATTENDED=1 bash -lc 'bash <(curl -fsSL http://10.0.2.2:$PROVISION_PORT)'" </dev/null || rc=$?
 
-  # Revoke the grant and reboot into the fully configured desktop.
-  vm_guest_ssh "sudo sh -c 'rm -f $grant; systemctl stop omarchy-vm-provision-expire.timer; systemctl reboot'" </dev/null >/dev/null 2>&1 || true
+  # Apply the setup to the live desktop instead of rebooting: the guest setup
+  # already started the agents and reloaded Hyprland, so only a VM still sitting
+  # at the SDDM greeter needs SDDM restarted to pick up the new autologin. A
+  # kernel the update installed simply takes effect on the next boot.
+  if [ "$rc" -eq 0 ] && ! vm_guest_ssh 'pgrep -u "$USER" -x Hyprland' >/dev/null 2>&1; then
+    say "Logging in to the desktop..."
+    vm_guest_ssh "sudo systemctl restart sddm" </dev/null >/dev/null 2>&1 || true
+  fi
+  vm_guest_ssh "sudo sh -c 'rm -f $grant; systemctl stop omarchy-vm-provision-expire.timer'" </dev/null >/dev/null 2>&1 || true
   [ "$rc" -eq 0 ] || { warn "Guest setup failed (exit $rc)."; return 1; }
-
-  # Wait for the old session to go down, so the screen fit that follows talks
-  # to the rebooted guest rather than the one shutting down.
-  say "Rebooting guest into the configured desktop..."
-  for _ in $(seq 1 60); do
-    auto_ssh_ready || break
-    sleep 2
-  done
 }
 
 vm_eject_cidata() {

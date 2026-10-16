@@ -133,12 +133,20 @@ run_provisioner() {
   kill -0 "$PROV_PID" 2>/dev/null || die "Could not bind provisioning server on port $PROVISION_PORT"
 
   vm_start
-  vm_open_viewer
+
+  # Hands-free installs run out of sight and the window opens once Omarchy is
+  # ready. The interactive installer and the LUKS unlock prompt need it now.
+  local viewer_open=0
+  if [ "${AUTO_MODE:-0}" -eq 0 ] || [ "$AUTO_ENCRYPT" = "1" ]; then
+    vm_open_viewer
+    viewer_open=1
+  fi
 
   if [ "${AUTO_MODE:-0}" -eq 1 ] && ! auto_install_and_provision; then
     warn "Hands-free setup did not finish; falling back to the manual steps below"
     warn "(skip any step the VM has already completed)."
     AUTO_MODE=0
+    [ "$viewer_open" -eq 1 ] || { vm_open_viewer; viewer_open=1; }
   fi
 
   if [ "${AUTO_MODE:-0}" -eq 0 ]; then
@@ -179,6 +187,7 @@ run_provisioner() {
     vm_eject_iso
     # Subshell: vm_fit_resolution exits via die on failure.
     ( vm_fit_resolution --wait ) || warn "Could not match the guest screen to the host; reopen with: omarchy open"
+    [ "$viewer_open" -eq 1 ] || vm_open_viewer
 
     echo -e "\n${BOLD}${GREEN}================================================================${NC}"
     echo -e "${BOLD}${GREEN}               Omarchy VM Ready!                                ${NC}"
