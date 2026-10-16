@@ -162,24 +162,17 @@ auto_ssh_ready() {
   vm_guest_ssh true >/dev/null 2>&1
 }
 
-# Wait for the hands-free install, then provision the guest over SSH.
-# Returns non-zero if any stage could not complete.
-auto_install_and_provision() {
-  local deadline=$(( $(date +%s) + PROVISION_TIMEOUT ))
+PROVISION_GRANT="/etc/sudoers.d/zz-omarchy-vm-provision"
+PROVISION_EXPIRE_UNIT="omarchy-vm-provision-expire"
 
-  local start ticks=0
+# Wait until the installed system answers over SSH, showing elapsed time.
+# Checks every 10s; on a terminal the time updates in place, in a log it gets a
+# line per minute instead.
+auto_wait_for_ssh() {
+  local label="$1" deadline=$(( $(date +%s) + PROVISION_TIMEOUT )) start ticks=0 elapsed tty=0
   start=$(date +%s)
-  if [ "$AUTO_ENCRYPT" = "1" ]; then
-    echo -e "\n${BOLD}${GREEN}Installing Omarchy automatically.${NC}"
-    echo -e "${YELLOW}Encrypted disk: type your password in the VM window when it asks to unlock.${NC}"
-  else
-    echo -e "\n${BOLD}${GREEN}Installing Omarchy in the background — its window opens when everything is ready.${NC}"
-  fi
-  # Check every 10s. On a terminal the elapsed time updates in place; in a log
-  # it gets a line per minute instead.
-  local elapsed tty=0
   [ -t 1 ] && tty=1
-  say "Installing (usually a few minutes)..."
+  say "$label (usually a few minutes)..."
   until auto_ssh_ready; do
     [ "$(date +%s)" -lt "$deadline" ] || { [ "$tty" -eq 0 ] || echo; warn "Timed out waiting for the installed system."; return 1; }
     vm_is_running || { [ "$tty" -eq 0 ] || echo; warn "VM stopped before the install finished."; return 1; }
@@ -187,29 +180,141 @@ auto_install_and_provision() {
     ticks=$((ticks + 1))
     elapsed=$(( $(date +%s) - start ))
     if [ "$tty" -eq 1 ]; then
-      printf '\r%b Still installing... %dm%02ds ' "${BLUE}[omarchy]${NC}" $((elapsed / 60)) $((elapsed % 60))
+      printf '\r%b %s... %dm%02ds ' "${BLUE}[omarchy]${NC}" "$label" $((elapsed / 60)) $((elapsed % 60))
     elif (( ticks % 6 == 0 )); then
-      say "Still installing... ($((elapsed / 60)) min)"
+      say "$label... ($((elapsed / 60)) min)"
     fi
   done
   [ "$tty" -eq 0 ] || echo
-  ok "Omarchy installed and reachable over SSH."
+  ok "Omarchy is up and reachable over SSH."
+}
 
+# Hands-free: the CIDATA drive answers the installer; wait for it, then provision.
+auto_install_and_provision() {
+  if [ "$AUTO_ENCRYPT" = "1" ]; then
+    echo -e "\n${BOLD}${GREEN}Installing Omarchy automatically.${NC}"
+    echo -e "${YELLOW}Encrypted disk: type your password in the VM window when it asks to unlock.${NC}"
+  else
+    echo -e "\n${BOLD}${GREEN}Installing Omarchy in the background — its window opens when everything is ready.${NC}"
+  fi
+  auto_wait_for_ssh "Installing" || return 1
+  auto_provision_guest
+}
+
+# Fail the guided wait once the deadline passes or the VM goes away.
+guided_alive() {
+  [ "$(date +%s)" -lt "$1" ] && vm_is_running
+}
+
+# Full installer experience (--full-exp): the user goes through Omarchy's own
+# installer in the VM window. Meanwhile the host, as root in the live ISO via its
+# guest agent, hands the installer our SSH key and, once it finishes, seeds a
+# temporary sudo grant into the still-mounted target. When the user clicks
+# Reboot Now the window closes, setup runs here, and the window reopens on the
+# finished desktop.
+auto_guided_install() {
+  local deadline=$(( $(date +%s) + PROVISION_TIMEOUT )) seen_installer=0 user="" encrypted=""
+
+  echo -e "\n${BOLD}${GREEN}Go through the Omarchy installer in the VM window.${NC}"
+  echo -e "When it finishes, click ${BOLD}Reboot Now${NC}; setup then continues here and the VM reopens when ready.\n"
+
+  say "Waiting for the installer to start..."
+  until vm_agent_up; do
+    guided_alive "$deadline" || { warn "The installer never came up."; return 1; }
+    sleep 2
+  done
+  # The ISO clears /root/authorized_keys just before its configurator starts,
+  # and the installer reads it when the install begins, so write it in between.
+  # (The [x] patterns keep pgrep from matching the sh -c that runs it.)
+  until vm_agent_sh 'pgrep -f "[c]onfigurator|[o]rchestrator.main" >/dev/null' >/dev/null 2>&1; do
+    guided_alive "$deadline" || { warn "The installer never came up."; return 1; }
+    sleep 2
+  done
+  vm_agent_sh 'umask 077; cat > /root/authorized_keys' "$(cat "$PUBKEY")" >/dev/null \
+    || { warn "Could not hand the SSH key to the installer."; return 1; }
+  ok "Host SSH key handed to the installer."
+
+  # The install is done when its orchestrator exits (the target stays mounted).
+  # The wizard's answers are on disk once it starts, so read them right then:
+  # by the time it exits, a Reboot Now click may already be on its way.
+  say "Waiting for the installation to finish..."
+  while true; do
+    guided_alive "$deadline" || { warn "Timed out waiting for the installer."; return 1; }
+    if vm_agent_sh 'pgrep -f "[o]rchestrator.main" >/dev/null' >/dev/null 2>&1; then
+      if [ "$seen_installer" -eq 0 ]; then
+        seen_installer=1
+        user="$(vm_agent_sh 'jq -r ".users[0].username // empty" /root/user_credentials.json' 2>/dev/null | tr -d '[:space:]')" || true
+        encrypted="$(vm_agent_sh 'cat /root/user_encrypt_installation.txt' 2>/dev/null | tr -d '[:space:]')" || true
+        [ -n "$user" ] && { AUTO_USER="$user"; export OMARCHY_GUEST_USER="$user"; }
+        [ "$encrypted" = "true" ] && AUTO_ENCRYPT=1
+        ok "Installing Omarchy${user:+ for $user}..."
+      fi
+    elif [ "$seen_installer" -eq 1 ]; then
+      break
+    elif ! vm_agent_up; then
+      warn "The installer rebooted before the host could prepare setup."
+      break
+    fi
+    sleep 0.5
+  done
+
+  if [ -n "$user" ] && vm_agent_sh 'mountpoint -q /mnt' >/dev/null 2>&1; then
+    # Seed the grant the hands-free path creates over SSH, plus a boot timer that
+    # revokes it after an hour in case this host process never cleans up.
+    vm_agent_sh "set -e
+      d=/mnt/etc/systemd/system
+      umask 337
+      printf 'Defaults:$user verifypw=any\n$user ALL=(ALL) NOPASSWD: ALL\n' > /mnt$PROVISION_GRANT
+      visudo -cqf /mnt$PROVISION_GRANT
+      umask 022
+      printf '[Unit]\nDescription=Revoke omarchy-vm setup sudo\n[Service]\nType=oneshot\nExecStart=/bin/sh -c \"rm -f $PROVISION_GRANT /etc/systemd/system/$PROVISION_EXPIRE_UNIT.* /etc/systemd/system/timers.target.wants/$PROVISION_EXPIRE_UNIT.timer\"\n' > \$d/$PROVISION_EXPIRE_UNIT.service
+      printf '[Timer]\nOnBootSec=60min\n[Install]\nWantedBy=timers.target\n' > \$d/$PROVISION_EXPIRE_UNIT.timer
+      mkdir -p \$d/timers.target.wants
+      ln -sf ../$PROVISION_EXPIRE_UNIT.timer \$d/timers.target.wants/$PROVISION_EXPIRE_UNIT.timer" >/dev/null \
+      || warn "Could not prepare sudo for setup; you will be asked for your password."
+  fi
+
+  echo -e "${GREEN}[   ok  ]${NC} Omarchy installed${user:+ for $user}. Click ${BOLD}Reboot Now${NC} in the VM window."
+  # The live ISO's agent goes away as the VM reboots: close the window then.
+  while vm_agent_up; do
+    guided_alive "$deadline" || { warn "Timed out waiting for the reboot."; return 1; }
+    sleep 1
+  done
+  if [ "$AUTO_ENCRYPT" = "1" ]; then
+    echo -e "${YELLOW}Unlock the disk with your password in the VM window when it asks.${NC}"
+  else
+    vm_close_viewer
+    echo -e "\n${BOLD}${GREEN}Rebooting into Omarchy — finishing setup in the background; the window reopens when ready.${NC}"
+  fi
+
+  [ -n "${OMARCHY_GUEST_USER:-}" ] || { warn "Could not read the username from the installer."; return 1; }
+  auto_wait_for_ssh "Booting and setting up" || return 1
+  auto_provision_guest
+}
+
+# Shared tail of both paths: get temporary sudo, run the guest setup over SSH,
+# and apply it to the live desktop. Returns non-zero if setup could not finish.
+auto_provision_guest() {
   # The installer media is no longer needed; drop it so later boots skip it.
   vm_eject_iso
   vm_eject_cidata
 
-  local user="$AUTO_USER" grant="/etc/sudoers.d/zz-omarchy-vm-provision"
-  # Temporary passwordless sudo for the unattended setup. verifypw=any lets the
-  # `sudo -v` calls in omarchy update pass too, and a transient timer revokes the
-  # grant after an hour even if this host process dies before cleaning up.
-  say "Granting temporary sudo for guest setup..."
-  printf '%s\n' "$AUTO_PASSWORD" | vm_guest_ssh "sudo -S -p '' sh -c '
-    umask 337
-    printf \"Defaults:$user verifypw=any\n$user ALL=(ALL) NOPASSWD: ALL\n\" > $grant
-    visudo -cqf $grant || { rm -f $grant; exit 1; }
-    systemd-run --on-active=60m --unit=omarchy-vm-provision-expire rm -f $grant >/dev/null 2>&1 || true'" \
-    || { warn "Could not obtain sudo in the guest."; return 1; }
+  local user="${OMARCHY_GUEST_USER:-$AUTO_USER}" grant="$PROVISION_GRANT" pw="$AUTO_PASSWORD"
+  if ! vm_guest_ssh 'sudo -n true' </dev/null >/dev/null 2>&1; then
+    # No grant seeded during the install: create one with the password.
+    # verifypw=any lets the `sudo -v` calls in omarchy update pass too, and a
+    # transient timer revokes it after an hour even if this host process dies.
+    if [ -z "$pw" ]; then
+      read -r -s -p "Password you set for $user in the installer (for setup's sudo): " pw; echo
+    fi
+    say "Granting temporary sudo for guest setup..."
+    printf '%s\n' "$pw" | vm_guest_ssh "sudo -S -p '' sh -c '
+      umask 337
+      printf \"Defaults:$user verifypw=any\n$user ALL=(ALL) NOPASSWD: ALL\n\" > $grant
+      visudo -cqf $grant || { rm -f $grant; exit 1; }
+      systemd-run --on-active=60m --unit=$PROVISION_EXPIRE_UNIT rm -f $grant >/dev/null 2>&1 || true'" \
+      || { warn "Could not obtain sudo in the guest."; return 1; }
+  fi
 
   say "Running guest setup (updates, guest tools, clipboard bridge)..."
   local rc=0
@@ -223,7 +328,9 @@ auto_install_and_provision() {
     say "Logging in to the desktop..."
     vm_guest_ssh "sudo systemctl restart sddm" </dev/null >/dev/null 2>&1 || true
   fi
-  vm_guest_ssh "sudo sh -c 'rm -f $grant; systemctl stop omarchy-vm-provision-expire.timer'" </dev/null >/dev/null 2>&1 || true
+  vm_guest_ssh "sudo sh -c 'systemctl stop $PROVISION_EXPIRE_UNIT.timer 2>/dev/null
+    rm -f $grant /etc/systemd/system/$PROVISION_EXPIRE_UNIT.* /etc/systemd/system/timers.target.wants/$PROVISION_EXPIRE_UNIT.timer
+    systemctl daemon-reload'" </dev/null >/dev/null 2>&1 || true
   [ "$rc" -eq 0 ] || { warn "Guest setup failed (exit $rc)."; return 1; }
 }
 

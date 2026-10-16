@@ -33,7 +33,11 @@ After that, `omarchy open` and `omarchy stop` work from anywhere.
 | `omarchy reset [ISO]` | Erase the VM and install Omarchy again from scratch |
 | `omarchy delete` | Erase the VM completely (disk, firmware state, app launcher entry). The `omarchy` command and downloaded ISOs are kept |
 
-`reset` and `delete` ask before erasing anything; `-y` skips the prompt. `install --manual` uses the interactive Omarchy installer instead of the hands-free one. `OMARCHY_ENCRYPT=1 omarchy install` creates an encrypted disk, which you unlock in the VM window at each boot; that window opens right away.
+`reset` and `delete` ask before erasing anything; `-y` skips the prompt.
+
+**Want the real installer experience?** `omarchy install --full-exp` opens the VM on Omarchy's own installer screens, where you pick the keyboard, user, password and disk yourself. When you click **Reboot Now**, the window closes, setup finishes in the background with progress in your terminal, and the window reopens on the ready desktop. The host handles this through the live installer's guest agent: it gives the installer your host SSH key, and it puts a temporary sudo grant into the new system so setup never needs your password.
+
+`install --manual` is the bare interactive installer: afterwards you run the printed setup command in the guest yourself. `OMARCHY_ENCRYPT=1 omarchy install` creates an encrypted disk, which you unlock in the VM window at each boot; that window opens right away.
 
 After the first install, `omarchy` is on your `PATH` (`~/.local/bin/omarchy`), and **"Omarchy VM"** shows up in your app launcher. On an Omarchy host, which has its own `omarchy` command, the shortcut is skipped; run `~/omarchy-vm/omarchy` instead.
 

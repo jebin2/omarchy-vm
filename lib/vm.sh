@@ -51,6 +51,36 @@ vm_agent_up() {
   virsh -c "$URI" qemu-agent-command "$DOMAIN" '{"execute":"guest-ping"}' >/dev/null 2>&1
 }
 
+# Run a shell script as root in the guest through its agent, optionally feeding
+# it STDIN. Prints the script's stdout and returns its exit code (125 when the
+# agent itself is unreachable).
+vm_agent_sh() {
+  python3 - "$URI" "$DOMAIN" "$1" "${2:-}" <<'PY'
+import base64, json, subprocess, sys, time
+uri, dom, script, stdin = sys.argv[1:5]
+
+def agent(cmd):
+    r = subprocess.run(["virsh", "-c", uri, "qemu-agent-command", dom, json.dumps(cmd)],
+                       capture_output=True, text=True)
+    if r.returncode:
+        sys.exit(125)
+    return json.loads(r.stdout)["return"]
+
+args = {"path": "/bin/sh", "arg": ["-c", script], "capture-output": True}
+if stdin:
+    args["input-data"] = base64.b64encode(stdin.encode()).decode()
+pid = agent({"execute": "guest-exec", "arguments": args})["pid"]
+while not (status := agent({"execute": "guest-exec-status", "arguments": {"pid": pid}})).get("exited"):
+    time.sleep(0.2)
+sys.stdout.write(base64.b64decode(status.get("out-data", "")).decode(errors="replace"))
+sys.exit(status.get("exitcode", 1))
+PY
+}
+
+vm_close_viewer() {
+  pkill -f "virt-viewer.*$DOMAIN" 2>/dev/null || true
+}
+
 vm_start() {
   local s rc=0
   s="$(vm_state 2>/dev/null)" || rc=$?
