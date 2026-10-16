@@ -193,7 +193,7 @@ auto_wait_for_ssh() {
 auto_install_and_provision() {
   if [ "$AUTO_ENCRYPT" = "1" ]; then
     echo -e "\n${BOLD}${GREEN}Installing Omarchy automatically.${NC}"
-    echo -e "${YELLOW}Encrypted disk: type your password in the VM window when it asks to unlock.${NC}"
+    echo -e "${YELLOW}Encrypted disk: type your password in the VM window when it asks to unlock; it closes again while setup finishes.${NC}"
   else
     echo -e "\n${BOLD}${GREEN}Installing Omarchy in the background — its window opens when everything is ready.${NC}"
   fi
@@ -279,6 +279,12 @@ auto_guided_install() {
       || warn "Could not prepare sudo for setup; you will be asked for your password."
   fi
 
+  # Encrypted disk: unlock the first boot with a one-time key, so the window can
+  # stay closed through it. Setup removes the key again.
+  if [ "$AUTO_ENCRYPT" = "1" ] && vm_agent_sh 'mountpoint -q /mnt/boot' >/dev/null 2>&1; then
+    auto_seed_unlock_key || warn "Could not set up automatic unlock; the window opens at boot so you can unlock the disk."
+  fi
+
   echo -e "${GREEN}[   ok  ]${NC} Omarchy installed${user:+ for $user}. Click ${BOLD}Reboot Now${NC} in the VM window."
   while vm_is_running; do
     [ "$(date +%s)" -lt "$deadline" ] || { warn "Timed out waiting for Reboot Now."; return 1; }
@@ -288,14 +294,28 @@ auto_guided_install() {
 
   # Boot the installed system ourselves (the live --live action is gone now).
   vm_start >/dev/null
-  if [ "$AUTO_ENCRYPT" = "1" ]; then
+  if [ "$AUTO_ENCRYPT" = "1" ] && [ -z "$UNLOCK_KEY" ]; then
     vm_open_viewer
-    echo -e "${YELLOW}Unlock the disk with your password in the VM window when it asks.${NC}"
+    echo -e "${YELLOW}Unlock the disk with your password in the VM window; it closes again while setup finishes.${NC}"
   else
     echo -e "\n${BOLD}${GREEN}Booting Omarchy and finishing setup in the background — the window opens when ready.${NC}"
   fi
 
   [ -n "${OMARCHY_GUEST_USER:-}" ] || { warn "Could not read the username from the installer."; return 1; }
+  if [ -n "$UNLOCK_KEY" ]; then
+    # Should the key not unlock the disk, the boot sits at the password prompt
+    # out of sight: show the window after a while so it can be typed there.
+    local waited=0
+    say "Booting and unlocking the disk automatically..."
+    until auto_ssh_ready || [ "$waited" -ge 120 ]; do
+      sleep 5
+      waited=$((waited + 5))
+    done
+    if ! auto_ssh_ready; then
+      vm_open_viewer
+      warn "Automatic unlock did not finish; type your disk password in the VM window."
+    fi
+  fi
   auto_wait_for_ssh "Booting and setting up" || return 1
   auto_provision_guest
 }
@@ -303,6 +323,13 @@ auto_guided_install() {
 # Shared tail of both paths: get temporary sudo, run the guest setup over SSH,
 # and apply it to the live desktop. Returns non-zero if setup could not finish.
 auto_provision_guest() {
+  # A window left open for the unlock prompt closes once past it: setup runs out
+  # of sight and the window reopens on the finished desktop.
+  if [ "$AUTO_ENCRYPT" = "1" ] && pgrep -f "(^|/)virt-viewer -c .* -a $DOMAIN$" >/dev/null 2>&1; then
+    vm_close_viewer
+    say "Disk unlocked; finishing setup in the background — the window reopens when ready."
+  fi
+
   # The installer media is no longer needed; drop it so later boots skip it.
   vm_eject_iso
   vm_eject_cidata
@@ -336,10 +363,63 @@ auto_provision_guest() {
     say "Logging in to the desktop..."
     vm_guest_ssh "sudo systemctl restart sddm" </dev/null >/dev/null 2>&1 || true
   fi
+  auto_remove_unlock_key
   vm_guest_ssh "sudo sh -c 'systemctl stop $PROVISION_EXPIRE_UNIT.timer 2>/dev/null
     rm -f $grant /etc/systemd/system/$PROVISION_EXPIRE_UNIT.* /etc/systemd/system/timers.target.wants/$PROVISION_EXPIRE_UNIT.timer
     systemctl daemon-reload'" </dev/null >/dev/null 2>&1 || true
   [ "$rc" -eq 0 ] || { warn "Guest setup failed (exit $rc)."; return 1; }
+}
+
+UNLOCK_KEY=""
+UNLOCK_IMG="$IMAGE_DIR/unlock.img"
+UNLOCK_SERIAL="omvmunlock"
+# Omarchy boots through mkinitcpio's encrypt hook, which reads a raw key from a
+# block device given as device:offset:length, and falls back to the passphrase
+# prompt when the key is missing or wrong.
+UNLOCK_PARAM="cryptkey=/dev/disk/by-id/virtio-$UNLOCK_SERIAL:0:64"
+
+# In the live ISO, with the new system still mounted: add a random one-time key
+# to the LUKS volume (authorized with the passphrase from the installer's
+# answers), add UNLOCK_PARAM to the boot entries, and attach a tiny disk holding
+# the key for the next start. Sets UNLOCK_KEY.
+auto_seed_unlock_key() {
+  local key
+  key="$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+  vm_agent_sh "set -e
+    umask 077
+    cat > /tmp/omvm.key
+    dev=\$(lsblk -rno PATH,FSTYPE | awk '\$2 == \"crypto_LUKS\" { print \$1; exit }')
+    [ -n \"\$dev\" ]
+    jq -j '.encryption_password // empty' /root/user_credentials.json \\
+      | cryptsetup luksAddKey --batch-mode --key-file=- --pbkdf pbkdf2 --pbkdf-force-iterations 1000 \"\$dev\" /tmp/omvm.key
+    rm -f /tmp/omvm.key
+    sed -i -E 's#^([[:space:]]*(kernel_)?cmdline:.*)\$#\\1 $UNLOCK_PARAM#' /mnt/boot/limine.conf
+    grep -q '$UNLOCK_PARAM' /mnt/boot/limine.conf" "$key" >/dev/null 2>"$IMAGE_DIR/unlock.err" \
+    || { warn "Unlock key setup failed: $(tail -3 "$IMAGE_DIR/unlock.err" | tr '\n' ' ')"; rm -f "$IMAGE_DIR/unlock.err"; return 1; }
+  rm -f "$IMAGE_DIR/unlock.err"
+
+  ( umask 077; printf '%s' "$key" > "$UNLOCK_IMG"; truncate -s 1M "$UNLOCK_IMG" )
+  virsh -c "$URI" attach-disk "$DOMAIN" "$UNLOCK_IMG" vdb --targetbus virtio --subdriver raw \
+    --serial "$UNLOCK_SERIAL" --config >/dev/null || { warn "Could not attach the unlock key disk."; rm -f "$UNLOCK_IMG"; return 1; }
+  UNLOCK_KEY="$key"
+  ok "Disk set to unlock automatically on the first boot."
+}
+
+# Undo auto_seed_unlock_key from the booted system: drop the key slot and the
+# boot parameter, then detach and delete the key disk.
+auto_remove_unlock_key() {
+  [ -n "$UNLOCK_KEY" ] || return 0
+  vm_guest_ssh 'sudo sh -s' >/dev/null <<EOF || warn "Could not remove the one-time unlock key from the guest."
+set -e
+dev=\$(lsblk -rno PATH,FSTYPE | awk '\$2 == "crypto_LUKS" { print \$1; exit }')
+printf '%s' '$UNLOCK_KEY' | cryptsetup luksRemoveKey --batch-mode --key-file=- "\$dev"
+sed -i 's# $UNLOCK_PARAM##' /boot/limine.conf
+EOF
+  local flags=(--config)
+  vm_is_running && flags=(--live --config)
+  virsh -c "$URI" detach-disk "$DOMAIN" vdb "${flags[@]}" >/dev/null 2>&1 || true
+  rm -f "$UNLOCK_IMG"
+  UNLOCK_KEY=""
 }
 
 vm_eject_cidata() {

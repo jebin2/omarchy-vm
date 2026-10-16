@@ -37,7 +37,7 @@ vm_purge() {
       || virsh -c "$URI" undefine "$DOMAIN" --keep-nvram >/dev/null 2>&1 \
       || die "Could not undefine domain '$DOMAIN'."
   fi
-  rm -f "$DISK" "$NVRAM_PATH" "$GUEST_USER_FILE" "$DOMAIN_XML" "$IMAGE_DIR/cidata.iso"
+  rm -f "$DISK" "$NVRAM_PATH" "$GUEST_USER_FILE" "$DOMAIN_XML" "$IMAGE_DIR/cidata.iso" "$IMAGE_DIR/unlock.img"
   ok "Old VM removed (domain, disk, NVRAM, provisioning state)."
 }
 
@@ -73,6 +73,7 @@ pid = agent({"execute": "guest-exec", "arguments": args})["pid"]
 while not (status := agent({"execute": "guest-exec-status", "arguments": {"pid": pid}})).get("exited"):
     time.sleep(0.2)
 sys.stdout.write(base64.b64decode(status.get("out-data", "")).decode(errors="replace"))
+sys.stderr.write(base64.b64decode(status.get("err-data", "")).decode(errors="replace"))
 sys.exit(status.get("exitcode", 1))
 PY
 }
