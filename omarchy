@@ -28,13 +28,13 @@ confirm_wipe() {
   [[ "$ans" =~ ^[Yy] ]]
 }
 
-# Parse [ISO] [--full-exp|--manual] [-y] shared by install and reset.
-INSTALL_ISO="" INSTALL_MANUAL=0 INSTALL_FULL=0 INSTALL_YES=0
+# Parse [ISO] [--auto|--manual] [-y] shared by install and reset.
+INSTALL_ISO="" INSTALL_MANUAL=0 INSTALL_AUTO=0 INSTALL_YES=0
 parse_install_args() {
   while [ $# -gt 0 ]; do
     case "$1" in
       --manual) INSTALL_MANUAL=1 ;;
-      --full-exp) INSTALL_FULL=1 ;;
+      --auto) INSTALL_AUTO=1 ;;
       -y|--yes) INSTALL_YES=1 ;;
       *.iso)
         [ -f "$1" ] || die "ISO not found: $1"
@@ -61,12 +61,12 @@ cmd_install() {
   detect_ssh_key
   detect_iso "$INSTALL_ISO"
 
-  # AUTO_MODE: 0 = manual (curl in the guest), 1 = hands-free, 2 = full installer
-  # experience with host-driven setup after the reboot.
-  [ "$INSTALL_MANUAL" -eq 1 ] && [ "$INSTALL_FULL" -eq 1 ] && die "Pick one of --manual and --full-exp."
-  AUTO_MODE=1
+  # AUTO_MODE: 2 = Omarchy's own installer with host-driven setup after its
+  # reboot (default), 1 = hands-free (--auto), 0 = manual (curl in the guest).
+  [ "$INSTALL_MANUAL" -eq 1 ] && [ "$INSTALL_AUTO" -eq 1 ] && die "Pick one of --auto and --manual."
+  AUTO_MODE=2
+  [ "$INSTALL_AUTO" -eq 1 ] && AUTO_MODE=1
   [ "$INSTALL_MANUAL" -eq 1 ] && AUTO_MODE=0
-  [ "$INSTALL_FULL" -eq 1 ] && AUTO_MODE=2
   if [ "$AUTO_MODE" -eq 1 ]; then
     detect_autoinstall_deps
     auto_prompt_credentials
@@ -215,23 +215,24 @@ show_usage() {
 Usage: omarchy <command>
 
 Commands:
-  install [ISO]   Create the VM and install Omarchy hands-free. Downloads the
-                  latest Omarchy ISO unless you pass one.
+  install [ISO]   Create the VM and install Omarchy: go through its installer in
+                  the VM window and click Reboot Now; setup then finishes in
+                  the background and the VM reopens on the ready desktop.
+                  Downloads the latest Omarchy ISO unless you pass one.
   open            Start the VM (if needed) and open its window
   stop            Shut the VM down cleanly
   reset [ISO]     Erase the VM and install Omarchy again from scratch
   delete          Erase the VM completely
 
 Options:
-  --full-exp      (install/reset) Go through Omarchy's own installer screens and
-                  reboot; setup then finishes in the background and the VM
-                  reopens on the ready desktop
+  --auto          (install/reset) Hands-free: answer a username and password
+                  here; the install runs out of sight and the VM opens when ready
   --manual        (install/reset) Interactive installer, then run the printed
                   setup command in the guest yourself
   -y              (reset/delete) Skip the confirmation prompt
 
 Environment:
-  OMARCHY_ENCRYPT=1   Encrypted disk; unlock it in the VM window at each boot
+  OMARCHY_ENCRYPT=1   (--auto) Encrypted disk; unlock it in the VM window at each boot
 EOF
 }
 

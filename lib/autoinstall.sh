@@ -206,7 +206,7 @@ guided_alive() {
   [ "$(date +%s)" -lt "$1" ] && vm_is_running
 }
 
-# Full installer experience (--full-exp): the user goes through Omarchy's own
+# Default install: the user goes through Omarchy's own
 # installer in the VM window. Meanwhile the host, as root in the live ISO via its
 # guest agent, hands the installer our SSH key and, once it finishes, seeds a
 # temporary sudo grant into the still-mounted target. Reboot Now is turned into
