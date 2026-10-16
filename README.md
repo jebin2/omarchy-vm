@@ -1,8 +1,11 @@
-# Omarchy Linux VM — Automated Setup & Control
+# Omarchy VM
 
-High-performance, hardware-accelerated **Omarchy Linux** (Arch + Hyprland / Wayland) virtual machine on KVM/libvirt user session (`qemu:///session`).
+**Try [Omarchy](https://omarchy.org) without wiping your laptop.** One command gives you the real Omarchy install in a window on your current Linux, and your system stays exactly as it is.
 
-Features near-native **virgl 3D OpenGL acceleration**, **SPICE low-latency display**, **bi-directional Wayland↔XWayland clipboard sharing**, **dynamic host screen fitting**, and **SSH port forwarding**.
+- **The real installer**: you go through Omarchy's own setup screens. Click **Reboot Now** and the host takes over: the window closes, setup finishes in the background, and Omarchy reopens logged in and ready.
+- **Smooth, not laggy**: GPU-accelerated Hyprland (virgl 3D on Intel/AMD) over a low-latency SPICE display.
+- **Things just work**: copy-paste in both directions, a visible cursor, and a screen sized to your monitor.
+- **No root day to day**: it runs in your user's libvirt session. When you're done, `omarchy delete` removes it all.
 
 ---
 
@@ -15,7 +18,9 @@ git clone https://github.com/jebin2/omarchy-vm.git ~/omarchy-vm
 
 It installs any missing host packages (this may ask for your sudo password once), downloads the latest Omarchy ISO, and opens the VM on **Omarchy's own installer**, where you pick the keyboard, user, password and disk encryption yourself. When it shows **Reboot Now**, click it: the window closes, setup finishes in the background with progress in your terminal, and the window reopens on the ready, logged-in desktop. An encrypted disk unlocks itself for that first boot, so there's nothing to type after the installer.
 
-After that, `omarchy open` and `omarchy stop` work from anywhere.
+After that, `omarchy open` and `omarchy stop` work from anywhere. With an encrypted disk, later boots ask for your disk password in the VM window, as they would on a real machine.
+
+Inside the window, `Ctrl+Alt+F` toggles fullscreen and `Ctrl+Alt+G` releases the mouse.
 
 ### Requirements
 - A Linux host with KVM (hardware virtualization enabled in BIOS: VT-x / AMD-V).
@@ -80,7 +85,7 @@ omarchy-vm/
 │   ├── common.sh            # Global paths, constants, and logging helpers
 │   ├── detect.sh            # System, hardware, and dependency auto-detection
 │   ├── vm.sh                # Libvirt domain XML synthesis & lifecycle control
-│   ├── autoinstall.sh       # Hands-free install (CIDATA drive) & SSH-driven guest setup
+│   ├── autoinstall.sh       # Install flows (guided, --auto) & SSH-driven guest setup
 │   └── provisioner.py       # Standalone local HTTP provisioning server
 │
 ├── guest/                   # In-guest onboarding assets
