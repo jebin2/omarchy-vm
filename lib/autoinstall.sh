@@ -175,14 +175,24 @@ auto_install_and_provision() {
   else
     echo -e "\n${BOLD}${GREEN}Installing Omarchy in the background — its window opens when everything is ready.${NC}"
   fi
-  say "Installing (usually 5-15 min)..."
+  # Check every 10s. On a terminal the elapsed time updates in place; in a log
+  # it gets a line per minute instead.
+  local elapsed tty=0
+  [ -t 1 ] && tty=1
+  say "Installing (usually a few minutes)..."
   until auto_ssh_ready; do
-    [ "$(date +%s)" -lt "$deadline" ] || { warn "Timed out waiting for the installed system."; return 1; }
-    vm_is_running || { warn "VM stopped before the install finished."; return 1; }
-    sleep 5
+    [ "$(date +%s)" -lt "$deadline" ] || { [ "$tty" -eq 0 ] || echo; warn "Timed out waiting for the installed system."; return 1; }
+    vm_is_running || { [ "$tty" -eq 0 ] || echo; warn "VM stopped before the install finished."; return 1; }
+    sleep 10
     ticks=$((ticks + 1))
-    (( ticks % 12 )) || say "Still installing... ($(( ($(date +%s) - start) / 60 )) min)"
+    elapsed=$(( $(date +%s) - start ))
+    if [ "$tty" -eq 1 ]; then
+      printf '\r%b Still installing... %dm%02ds ' "${BLUE}[omarchy]${NC}" $((elapsed / 60)) $((elapsed % 60))
+    elif (( ticks % 6 == 0 )); then
+      say "Still installing... ($((elapsed / 60)) min)"
+    fi
   done
+  [ "$tty" -eq 0 ] || echo
   ok "Omarchy installed and reachable over SSH."
 
   # The installer media is no longer needed; drop it so later boots skip it.

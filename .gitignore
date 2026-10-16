@@ -16,3 +16,6 @@ __pycache__/
 # Backups
 *.bak*
 *.pre-reset-*
+
+# Local ISO package list extract
+arch/
