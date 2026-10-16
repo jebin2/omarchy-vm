@@ -2,6 +2,9 @@
 Description=Sync XWayland and Wayland clipboards for SPICE copy/paste
 PartOf=graphical-session.target
 After=graphical-session.target
+# spice-vdagent.service (the SPICE clipboard agent) has no [Install] section and
+# Hyprland does not run XDG autostart, so pull it in with the session here.
+Wants=spice-vdagent.service
 
 [Service]
 ExecStart=%h/.local/bin/vm-clipboard-bridge

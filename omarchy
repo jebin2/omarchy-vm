@@ -1,0 +1,385 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# Omarchy Linux VM — Unified Management Engine
+# ==============================================================================
+set -euo pipefail
+
+# Resolve symlinks (e.g. ~/.local/bin/omarchy) so lib/ is found next to the real script.
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+source "$SCRIPT_DIR/lib/common.sh"
+source "$SCRIPT_DIR/lib/detect.sh"
+source "$SCRIPT_DIR/lib/vm.sh"
+
+run_setup() {
+  local reset_mode=0 custom_iso="" no_start=0 confirm_yes=0 finish_mode=0 purge_mode=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --reset) reset_mode=1; shift ;;
+      --no-backup) purge_mode=1; shift ;;
+      -y|--yes) confirm_yes=1; shift ;;
+      --finish) finish_mode=1; shift ;;
+      --iso) custom_iso="$2"; shift 2 ;;
+      --no-start) no_start=1; shift ;;
+      -h|--help)
+        cat <<EOF
+Usage: $0 setup [options]
+
+Options:
+  --reset        Replace virtual disk (with backup) and boot installer ISO
+  --no-backup    Fresh install: if a VM already exists, permanently delete it
+                 (domain, disk, NVRAM) with no backup, then install from scratch
+  --finish       Eject installer ISO and boot directly from virtual disk
+  --iso PATH     Specify path to Omarchy ISO file (or pass the .iso positionally)
+  -y, --yes      Skip confirmation prompt on reset / purge
+  --no-start     Define VM without starting it immediately
+
+Examples:
+  $0 setup omarchy-4.0.4.iso --no-backup     # wipe any old VM, reinstall
+EOF
+        return 0 ;;
+      *)
+        # Support positional ISO path (e.g. omarchy reset /path/to/omarchy.iso)
+        if [ -f "$1" ] && [[ "$1" == *.iso ]]; then
+          custom_iso="$1"
+          shift
+        else
+          die "Unknown setup option or file: $1"
+        fi
+        ;;
+    esac
+  done
+
+  # Handle --finish (eject ISO persistently and boot installed system)
+  if [ "$finish_mode" -eq 1 ]; then
+    say "Finishing installation: ejecting installer ISO and booting installed system..."
+    if vm_is_running; then
+      vm_stop
+      [ "$(vm_state 2>/dev/null || true)" = "shut off" ] || die "VM did not shut down; refusing to alter its boot media."
+    fi
+    vm_eject_iso
+    vm_start
+    vm_open_viewer
+    ok "Booted from guest virtual disk."
+    return 0
+  fi
+
+  echo -e "\n${BOLD}================================================================${NC}"
+  echo -e "${BOLD}       Omarchy Linux VM — Automated Setup Engine               ${NC}"
+  echo -e "${BOLD}================================================================${NC}\n"
+
+  detect_dependencies
+  detect_kvm
+  detect_ovmf
+  detect_gpu
+  detect_ssh_key
+
+  # --no-backup: resolve the ISO first (so a missing ISO never leaves us with a
+  # purged VM and nothing to install), then wipe any previous VM without backups.
+  if [ "$purge_mode" -eq 1 ]; then
+    detect_iso "$custom_iso"
+    custom_iso="$ISO"
+    reset_mode=0
+    if vm_exists; then
+      if [ "$confirm_yes" -ne 1 ]; then
+        echo -e "${RED}WARNING:${NC} An existing Omarchy VM was found. --no-backup will PERMANENTLY delete"
+        echo -e "its disk ($DISK), UEFI NVRAM and libvirt domain. Nothing is backed up."
+        read -r -p "Type PURGE to continue: " ans
+        [ "$ans" = "PURGE" ] || { echo "Purge cancelled."; return 0; }
+      fi
+      vm_purge
+    else
+      ok "No existing VM found; continuing with a fresh install."
+    fi
+  fi
+
+  # An existing install (domain + disk present, no --reset) keeps its current
+  # CD-ROM state instead of re-attaching (or downloading) the installer ISO.
+  local existing_install=0
+  if [ "$reset_mode" -eq 0 ] && [ -z "$custom_iso" ] && [ -f "$DISK" ] \
+     && virsh -c "$URI" dominfo "$DOMAIN" >/dev/null 2>&1; then
+    existing_install=1
+    ISO="$(vm_current_iso)"
+    if [ -n "$ISO" ]; then
+      ok "Keeping attached ISO: $(basename "$ISO")"
+    else
+      ok "Existing install detected; installer ISO stays ejected."
+    fi
+  elif [ "$purge_mode" -eq 0 ]; then
+    detect_iso "$custom_iso"
+  fi
+
+  # Reset logic with graceful shutdown & safe backup order
+  if [ "$reset_mode" -eq 1 ]; then
+    if [ "$confirm_yes" -ne 1 ]; then
+      echo -e "${YELLOW}WARNING:${NC} This will replace the guest virtual disk and boot the installer ISO."
+      echo -e "The current virtual disk will be moved to a dated backup in: $IMAGE_DIR"
+      read -r -p "Type RESET to continue: " ans
+      if [ "$ans" != "RESET" ]; then
+        echo "Reset cancelled."
+        return 0
+      fi
+    fi
+
+    say "Reset requested. Checking VM state..."
+    local state="$(vm_state 2>/dev/null || echo "not found")"
+    if [ "$state" = "running" ]; then
+      say "Requesting graceful shutdown before replacing disk..."
+      virsh -c "$URI" shutdown "$DOMAIN" >/dev/null 2>&1 || true
+      for _ in $(seq 1 30); do
+        [ "$(vm_state 2>/dev/null || true)" = "shut off" ] && break
+        sleep 1
+      done
+      [ "$(vm_state 2>/dev/null || true)" = "shut off" ] || {
+        die "VM did not shut down cleanly; refusing to alter its disk. Power off manually or retry."
+      }
+      ok "VM shut down cleanly."
+    fi
+
+    local stamp="$(date +%Y%m%d-%H%M%S)"
+
+    # 1. Back up NVRAM BEFORE undefining (so libvirt --nvram does not delete the backup)
+    if [ -f "$NVRAM_PATH" ]; then
+      say "Archiving previous NVRAM state -> omarchy-vm_VARS.fd.pre-reset-$stamp"
+      mv "$NVRAM_PATH" "$NVRAM_PATH.pre-reset-$stamp"
+    fi
+
+    # 2. Undefine old domain
+    virsh -c "$URI" undefine "$DOMAIN" >/dev/null 2>&1 || true
+
+    # 3. Archive disk safely while shut off
+    if [ -e "$DISK" ]; then
+      say "Archiving previous disk -> omarchy.qcow2.pre-reset-$stamp"
+      mv "$DISK" "$IMAGE_DIR/omarchy.qcow2.pre-reset-$stamp"
+    fi
+    rm -f "$GUEST_USER_FILE"
+  fi
+
+  vm_create_disk
+  vm_synthesize_xml
+  vm_define
+  vm_install_desktop_entry
+
+  if [ "$no_start" -eq 1 ]; then
+    ok "VM defined successfully (--no-start specified). Start anytime with: $0 up"
+    return 0
+  fi
+
+  # Already-provisioned VM: just boot it; otherwise serve the guest setup and wait.
+  if [ "$existing_install" -eq 1 ] && [ -f "$GUEST_USER_FILE" ]; then
+    vm_start
+    vm_open_viewer
+    ok "VM configuration refreshed. Guest was already provisioned (re-run with: omarchy provision)."
+    return 0
+  fi
+  run_provisioner
+}
+
+# Globals so the EXIT trap can still see them after run_provisioner returns.
+PROV_PID=""
+SERVE_DIR=""
+cleanup_provisioner() {
+  [ -n "$PROV_PID" ] && kill "$PROV_PID" 2>/dev/null || true
+  [ -n "$SERVE_DIR" ] && rm -rf "$SERVE_DIR" || true
+}
+
+run_provisioner() {
+  say "Preparing provisioning assets..."
+
+  # Stop any previous instance of our own provisioner
+  pkill -f "provisioner.py.*$PROVISION_PORT" 2>/dev/null || true
+  sleep 0.5
+
+  # Check if port is already occupied by an unrelated service
+  if python3 -c "import socket, sys; s = socket.socket(socket.AF_INET, socket.SOCK_STREAM); sys.exit(0 if s.connect_ex(('127.0.0.1', int(sys.argv[1]))) == 0 else 1)" "$PROVISION_PORT" 2>/dev/null; then
+    die "Port $PROVISION_PORT is already in use by another service. Specify a free port with OMARCHY_PROVISION_PORT=<port>."
+  fi
+
+  SERVE_DIR="$(mktemp -d)"
+  trap cleanup_provisioner EXIT
+  # Bake the actual provisioning port into the served guest script.
+  sed "s#10\.0\.2\.2:8765#10.0.2.2:$PROVISION_PORT#g" "$GUEST_DIR/setup.sh" > "$SERVE_DIR/setup.sh"
+  cp "$SERVE_DIR/setup.sh" "$SERVE_DIR/guest-setup.sh"   # old URL: /guest-setup.sh
+  cp "$PUBKEY" "$SERVE_DIR/authorized_key"
+  cp "$GUEST_DIR/clipboard-bridge" "$GUEST_DIR/clipboard-bridge.service" "$SERVE_DIR/"
+
+  say "Starting provisioning server on 127.0.0.1:$PROVISION_PORT..."
+  python3 "$LIB_DIR/provisioner.py" "$PROVISION_PORT" "$SERVE_DIR" "$GUEST_USER_FILE" &
+  PROV_PID=$!
+
+  sleep 1
+  kill -0 "$PROV_PID" 2>/dev/null || die "Could not bind provisioning server on port $PROVISION_PORT"
+
+  vm_start
+  vm_open_viewer
+
+  echo -e "\n${BOLD}${GREEN}================================================================${NC}"
+  echo -e "${BOLD}${GREEN}               VM Booted & Installer Launched!                  ${NC}"
+  echo -e "${BOLD}${GREEN}================================================================${NC}\n"
+  echo -e "${BOLD}Next Steps in the VM Window:${NC}"
+  echo -e "  ${BOLD}1.${NC} Follow the Omarchy on-screen installer."
+  echo -e "  ${BOLD}2.${NC} When installation completes, reboot into the installed system."
+  echo -e "  ${BOLD}3.${NC} Open a terminal in Omarchy (${BOLD}Super + Enter${NC} or launch foot) and run:"
+  echo -e "\n      ${BOLD}${YELLOW}bash <(curl -fsSL http://10.0.2.2:$PROVISION_PORT)${NC}\n"
+  echo -e "  The host is waiting for this signal in the background...\n"
+
+  local timeout="$PROVISION_TIMEOUT"
+  local deadline=$(( $(date +%s) + timeout ))
+  local provisioned=0
+
+  say "Waiting for guest provisioning signal (timeout: $((timeout / 60)) min, press Ctrl+C to cancel)..."
+  while true; do
+    if [ -f "$GUEST_USER_FILE" ]; then
+      local user="$(cat "$GUEST_USER_FILE" | tr -d '[:space:]')"
+      echo -e "\n${GREEN}[omarchy] Guest reported completion as user: ${BOLD}$user${NC}!"
+      provisioned=1
+      break
+    fi
+
+    local now=$(date +%s)
+    if [ "$now" -ge "$deadline" ]; then
+      warn "Timed out waiting for guest setup callback after $((timeout / 60)) minutes."
+      warn "When logged into the VM, open a terminal and run:"
+      warn "    bash <(curl -fsSL http://10.0.2.2:$PROVISION_PORT)"
+      warn "Or start the host provisioning listener anytime with: omarchy provision"
+      break
+    fi
+    sleep 3
+  done
+
+  if [ "$provisioned" -eq 1 ]; then
+    # Subshell: vm_fit_resolution exits via die on failure.
+    ( vm_fit_resolution --wait ) || warn "Could not match the guest screen to the host; retry later with: omarchy fit"
+
+    echo -e "\n${BOLD}${GREEN}================================================================${NC}"
+    echo -e "${BOLD}${GREEN}               Omarchy VM Setup Complete!                       ${NC}"
+    echo -e "${BOLD}${GREEN}================================================================${NC}\n"
+    echo -e "  • ${BOLD}Open Display:${NC}   omarchy up   (or launch 'Omarchy VM' from app menu)"
+    echo -e "  • ${BOLD}SSH Access:${NC}     omarchy ssh  (or: ssh -p $SSH_PORT $user@127.0.0.1)"
+    echo -e "  • ${BOLD}Shut Down:${NC}      omarchy stop"
+    echo -e "  • ${BOLD}Status:${NC}         omarchy status\n"
+  fi
+}
+
+show_status() {
+  local s rc=0
+  s="$(vm_state 2>/dev/null)" || rc=$?
+  local user="$(resolve_guest_user)"
+  echo "=========================================="
+  echo " Omarchy VM Status"
+  echo "=========================================="
+  if [ $rc -eq 2 ]; then
+    echo "State:          query error"
+    echo "Detail:         $(virsh -c "$URI" domstate "$DOMAIN" 2>&1 | tr '\n' ' ')"
+  elif [ $rc -eq 1 ]; then
+    echo "State:          not defined (run: omarchy setup)"
+  else
+    echo "State:          $s"
+  fi
+
+  if [ "$s" = "running" ]; then
+    if vm_agent_up; then
+      echo "Guest Agent:    active (screen auto-fit & clean shutdown ready)"
+    else
+      echo "Guest Agent:    waiting / inactive"
+    fi
+    echo "SSH Access:     ssh -p $SSH_PORT $user@127.0.0.1"
+    echo "SPICE Display:  active (open with: omarchy open)"
+  else
+    echo "SSH Access:     offline"
+  fi
+  local iso=""
+  [ $rc -eq 0 ] && iso="$(vm_current_iso)"
+  echo "Installer ISO:  ${iso:-ejected}"
+  echo "Guest User:     $user"
+  echo "=========================================="
+}
+
+show_usage() {
+  cat <<EOF
+Usage: omarchy <command> [arguments]
+
+Commands:
+  setup [options]  Run the end-to-end setup engine (--reset, --iso PATH, --no-start)
+  up               Start VM, open SPICE display in virt-viewer, and auto-fit screen
+  start            Boot the VM in the background
+  stop | down      Clean graceful shutdown (Guest Agent -> ACPI -> Force)
+  toggle           Start and open the display if off, otherwise shut down
+  force-stop       Immediately power off VM
+  open             Open SPICE display in virt-viewer fullscreen
+  fit [RES]        Resize guest screen to host resolution (or custom RES, e.g. 1920x1080)
+  ssh [args...]    SSH into the guest VM ($SSH_PORT) with optional commands
+  status           Display VM state, guest agent, and network details
+  clipboard [-f]   Check host<->guest clipboard sharing and show (or follow) its log
+  eject            Eject installer ISO so VM boots only from virtual disk
+  reset [options]  Wipe virtual disk (with backup) and re-run installation (--finish, --iso)
+  provision        Run standalone local HTTP provisioning server
+  help             Show this help message
+EOF
+}
+
+cmd="${1:-}"
+case "$cmd" in
+  setup)
+    shift
+    run_setup "$@"
+    ;;
+  up)
+    vm_start
+    sleep 2
+    vm_open_viewer
+    ;;
+  start)
+    vm_start
+    ;;
+  stop|down)
+    vm_stop
+    ;;
+  toggle)
+    if vm_is_running; then
+      vm_stop
+    else
+      vm_start
+      sleep 3
+      vm_open_viewer
+    fi
+    ;;
+  force-stop)
+    vm_force_stop
+    ;;
+  open)
+    vm_open_viewer
+    ;;
+  fit)
+    shift
+    vm_fit_resolution "$@"
+    ;;
+  ssh|connect)
+    shift
+    vm_connect_ssh "$@"
+    ;;
+  status)
+    show_status
+    ;;
+  clipboard)
+    shift
+    vm_clipboard_status "$@"
+    ;;
+  eject)
+    vm_eject_iso
+    ;;
+  reset)
+    shift
+    run_setup --reset "$@"
+    ;;
+  provision)
+    detect_ssh_key
+    run_provisioner
+    ;;
+  help|-h|--help)
+    show_usage
+    ;;
+  *)
+    show_usage
+    [ -z "$cmd" ] || die "Unknown command: $cmd"
+    ;;
+esac

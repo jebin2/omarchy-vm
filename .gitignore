@@ -1,11 +1,18 @@
-# Downloaded installer and VM state
+# Virtual disks & NVRAM state
+images/*.qcow2*
+images/*.fd*
+images/.guest_user
+images/*.xml
+
+# ISO files
 *.iso
-/images/
+*.iso.*
 
-# Local logs and dated backups
+# Logs & temp files
 *.log
-*.bak
-*.bak-*
+*.tmp
+__pycache__/
 
-# Editor and OS files
-.DS_Store
+# Backups
+*.bak*
+*.pre-reset-*

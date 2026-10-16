@@ -3,7 +3,8 @@
 # spice-vdagent only speaks X11, so host<->guest clipboard data lands in the
 # XWayland CLIPBOARD selection; Hyprland does not reliably mirror that to Wayland.
 # Text only. Each direction compares contents first, so the two loops don't
-# ping-pong.
+# ping-pong. Each sync is logged (length only, never contents):
+#   journalctl --user -u vm-clipboard-bridge -f
 set -u
 
 x_get()  { timeout 3 xclip -o -selection clipboard 2>/dev/null; }
@@ -12,8 +13,12 @@ wl_get() { timeout 3 wl-paste -n -t text 2>/dev/null; }
 # X -> Wayland: clipnotify blocks until the X CLIPBOARD owner changes.
 x_to_wl() {
   while clipnotify -s clipboard; do
-    t="$(x_get)" || continue
-    [ -n "$t" ] && [ "$t" != "$(wl_get)" ] && printf '%s' "$t" | wl-copy >/dev/null 2>&1
+    t="$(x_get)" || { echo "X11/host -> Wayland: change seen but no text to read"; continue; }
+    if [ -n "$t" ] && [ "$t" != "$(wl_get)" ]; then
+      printf '%s' "$t" | wl-copy >/dev/null 2>&1 \
+        && echo "X11/host -> Wayland: synced ${#t} chars" \
+        || echo "X11/host -> Wayland: wl-copy failed"
+    fi
   done
 }
 
@@ -23,10 +28,16 @@ wl_to_x() {
     t="$(cat)"
     [ -n "$t" ] || exit 0
     [ "$t" = "$(timeout 3 xclip -o -selection clipboard 2>/dev/null)" ] && exit 0
-    printf "%s" "$t" | xclip -selection clipboard -i >/dev/null 2>&1'
+    if printf "%s" "$t" | xclip -selection clipboard -i >/dev/null 2>&1; then
+      echo "Wayland -> X11/host: synced ${#t} chars"
+    else
+      echo "Wayland -> X11/host: xclip failed"
+    fi'
 }
 
+echo "clipboard bridge started (DISPLAY=${DISPLAY:-unset} WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-unset})"
 x_to_wl &
 wl_to_x &
 wait -n
+echo "clipboard bridge: a sync loop exited; restarting"
 exit 1
