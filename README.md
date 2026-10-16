@@ -9,11 +9,19 @@ Features near-native **virgl 3D OpenGL acceleration**, **SPICE low-latency displ
 ## ⚡ Quick Start
 
 ```bash
-git clone <this repo> ~/omarchy-vm
+git clone https://github.com/jebin2/omarchy-vm.git ~/omarchy-vm
 ~/omarchy-vm/omarchy install
 ```
 
-Choose a username and password when asked, and that's all the input it needs. It downloads the latest Omarchy ISO, installs it hands-free, sets it up, and opens it fullscreen on your desktop.
+Choose a username and password when asked, and that's all the input it needs. It installs any missing host packages (this may ask for your sudo password once), downloads the latest Omarchy ISO, installs it hands-free, sets it up, and opens it fullscreen on your desktop.
+
+After that, `omarchy open` and `omarchy stop` work from anywhere.
+
+### Requirements
+- A Linux host with KVM (hardware virtualization enabled in BIOS: VT-x / AMD-V).
+- An Intel or AMD GPU for smooth 3D-accelerated graphics. NVIDIA-only machines still work, but without 3D acceleration.
+- About 50 GB of free disk space: a ~6 GB ISO plus a virtual disk that can grow to 40 GB.
+- Arch, Fedora or Debian/Ubuntu for automatic package install (`pacman`, `dnf` or `apt`). Other distros need the packages listed below installed by hand.
 
 ## 🕹️ Commands
 
