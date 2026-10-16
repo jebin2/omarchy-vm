@@ -214,9 +214,10 @@ guided_alive() {
 # VM out of sight, runs setup, and opens the window on the finished desktop.
 auto_guided_install() {
   local deadline=$(( $(date +%s) + PROVISION_TIMEOUT )) seen_installer=0 user="" encrypted=""
+  local target_prepared=0
 
   echo -e "\n${BOLD}${GREEN}Go through the Omarchy installer in the VM window.${NC}"
-  echo -e "When it finishes, click ${BOLD}Reboot Now${NC}; setup then continues here and the VM reopens when ready.\n"
+  echo -e "When Omarchy shows ${BOLD}Reboot Now${NC}, click it. The host holds the reboot briefly while it prepares the first boot; the VM reopens when setup is done.\n"
 
   say "Waiting for the installer to start..."
   until vm_agent_up; do
@@ -233,17 +234,54 @@ auto_guided_install() {
   vm_agent_sh 'umask 077; cat > /root/authorized_keys' "$(cat "$PUBKEY")" >/dev/null \
     || { warn "Could not hand the SSH key to the installer."; return 1; }
   ok "Host SSH key handed to the installer."
+
+  # Hold a requested reboot in the live ISO until the host has finished preparing
+  # the installed target. This lets the user click Reboot Now immediately while
+  # qemu-guest-agent and /mnt remain available for the host-side work.
+  vm_agent_sh "set -e
+    sc=\$(command -v systemctl)
+    cp -L \"\$sc\" /run/omarchy-vm-systemctl.real
+    chmod 755 /run/omarchy-vm-systemctl.real
+    for action in reboot poweroff halt shutdown; do
+      ln -sf /run/omarchy-vm-systemctl.real \"/run/\$action\"
+    done
+    cat > \"\$sc\" <<'OMARCHY_VM_SYSTEMCTL'
+#!/bin/sh
+action=\${0##*/}
+hold=0
+case \"\$action\" in reboot|poweroff|halt|shutdown) hold=1 ;; esac
+for arg do
+  case \"\$arg\" in reboot|poweroff|halt|shutdown) hold=1 ;; esac
+done
+if [ \"\$hold\" -eq 1 ]; then
+  : > /run/omarchy-vm-reboot-requested
+  i=0
+  while [ ! -e /run/omarchy-vm-seed-done ] && [ \"\$i\" -lt 2400 ]; do
+    sleep 0.25
+    i=\$((i + 1))
+  done
+fi
+case "\$action" in
+  reboot|poweroff|halt|shutdown) exec \"/run/\$action\" \"\$@\" ;;
+esac
+exec /run/omarchy-vm-systemctl.real \"\$@\"
+OMARCHY_VM_SYSTEMCTL
+    chmod 755 \"\$sc\"" >/dev/null \
+    || warn "Could not hold the installer reboot; automatic setup may need the disk password."
+
   # For this run only (--live), a guest reboot powers the VM off instead.
   virsh -c "$URI" set-lifecycle-action "$DOMAIN" reboot destroy --live >/dev/null \
     || warn "Could not hold the VM at Reboot Now; it will reboot in the window."
 
-  # The install is done when its orchestrator exits (the target stays mounted).
-  # The wizard's answers are on disk once it starts, so read them right then:
-  # by the time it exits, a Reboot Now click may already be on its way.
+  # The install is done when its orchestrator exits; the dashboard then shows
+  # Reboot Now with the target still mounted. Read the wizard's answers as soon
+  # as the orchestrator starts, and prepare the first boot only after it exits:
+  # until then the installer still rewrites limine.conf (finalize_limine_boot)
+  # and takes the factory snapshot, which must not capture the sudo grant. The
+  # reboot hold above keeps an early Reboot Now click waiting meanwhile.
   say "Waiting for the installation to finish..."
   while true; do
     [ "$(date +%s)" -lt "$deadline" ] || { warn "Timed out waiting for the installer."; return 1; }
-    # Already powered off: Reboot Now came before we saw the installer exit.
     vm_is_running || break
     if vm_agent_sh 'pgrep -f "[o]rchestrator.main" >/dev/null' >/dev/null 2>&1; then
       if [ "$seen_installer" -eq 0 ]; then
@@ -252,47 +290,52 @@ auto_guided_install() {
         encrypted="$(vm_agent_sh 'cat /root/user_encrypt_installation.txt' 2>/dev/null | tr -d '[:space:]')" || true
         [ -n "$user" ] && { AUTO_USER="$user"; export OMARCHY_GUEST_USER="$user"; }
         [ "$encrypted" = "true" ] && AUTO_ENCRYPT=1
+        if [ "$AUTO_ENCRYPT" = "1" ]; then
+          AUTO_PASSWORD="$(vm_agent_sh 'jq -j ".encryption_password // empty" /root/user_credentials.json' 2>/dev/null || true)"
+        fi
         ok "Installing Omarchy${user:+ for $user}..."
       fi
     elif [ "$seen_installer" -eq 1 ]; then
-      break
-    elif ! vm_agent_up; then
-      warn "The installer rebooted before the host could prepare setup."
       break
     fi
     sleep 0.5
   done
 
-  if [ -n "$user" ] && vm_agent_sh 'mountpoint -q /mnt' >/dev/null 2>&1; then
-    # Seed the grant the hands-free path creates over SSH, plus a boot timer that
-    # revokes it after an hour in case this host process never cleans up.
-    vm_agent_sh "set -e
-      d=/mnt/etc/systemd/system
-      umask 337
-      printf 'Defaults:$user verifypw=any\n$user ALL=(ALL) NOPASSWD: ALL\n' > /mnt$PROVISION_GRANT
-      visudo -cqf /mnt$PROVISION_GRANT
-      umask 022
-      printf '[Unit]\nDescription=Revoke omarchy-vm setup sudo\n[Service]\nType=oneshot\nExecStart=/bin/sh -c \"rm -f $PROVISION_GRANT /etc/systemd/system/$PROVISION_EXPIRE_UNIT.* /etc/systemd/system/timers.target.wants/$PROVISION_EXPIRE_UNIT.timer\"\n' > \$d/$PROVISION_EXPIRE_UNIT.service
-      printf '[Timer]\nOnBootSec=60min\n[Install]\nWantedBy=timers.target\n' > \$d/$PROVISION_EXPIRE_UNIT.timer
-      mkdir -p \$d/timers.target.wants
-      ln -sf ../$PROVISION_EXPIRE_UNIT.timer \$d/timers.target.wants/$PROVISION_EXPIRE_UNIT.timer" >/dev/null \
-      || warn "Could not prepare sudo for setup; you will be asked for your password."
+  if vm_is_running && vm_agent_sh 'mountpoint -q /mnt' >/dev/null 2>&1; then
+    if [ -n "$user" ]; then
+      # Seed the grant the hands-free path creates over SSH, plus a boot timer that
+      # revokes it after an hour in case this host process never cleans up.
+      vm_agent_sh "set -e
+        d=/mnt/etc/systemd/system
+        umask 337
+        printf 'Defaults:$user verifypw=any\n$user ALL=(ALL) NOPASSWD: ALL\n' > /mnt$PROVISION_GRANT
+        visudo -cqf /mnt$PROVISION_GRANT
+        umask 022
+        printf '[Unit]\nDescription=Revoke omarchy-vm setup sudo\n[Service]\nType=oneshot\nExecStart=/bin/sh -c \"rm -f $PROVISION_GRANT /etc/systemd/system/$PROVISION_EXPIRE_UNIT.* /etc/systemd/system/timers.target.wants/$PROVISION_EXPIRE_UNIT.timer\"\n' > \$d/$PROVISION_EXPIRE_UNIT.service
+        printf '[Timer]\nOnBootSec=60min\n[Install]\nWantedBy=timers.target\n' > \$d/$PROVISION_EXPIRE_UNIT.timer
+        mkdir -p \$d/timers.target.wants
+        ln -sf ../$PROVISION_EXPIRE_UNIT.timer \$d/timers.target.wants/$PROVISION_EXPIRE_UNIT.timer" >/dev/null \
+        || warn "Could not prepare sudo for setup; you will be asked for your password."
+    fi
+    if [ "$AUTO_ENCRYPT" = "1" ]; then
+      auto_seed_unlock_key || warn "Could not set up automatic unlock; the window opens at boot so you can unlock the disk."
+    fi
+    target_prepared=1
   fi
+  # Release the held reboot (if Reboot Now was already clicked, it goes through now).
+  vm_agent_sh 'touch /run/omarchy-vm-seed-done' >/dev/null 2>&1 || true
 
-  # Encrypted disk: unlock the first boot with a one-time key, so the window can
-  # stay closed through it. Setup removes the key again.
-  if [ "$AUTO_ENCRYPT" = "1" ] && vm_agent_sh 'mountpoint -q /mnt/boot' >/dev/null 2>&1; then
-    auto_seed_unlock_key || warn "Could not set up automatic unlock; the window opens at boot so you can unlock the disk."
+  if vm_is_running; then
+    [ "$target_prepared" -eq 1 ] || warn "The VM rebooted before host setup could be prepared."
+    echo -e "${GREEN}[   ok  ]${NC} Omarchy installed${user:+ for $user}. Click ${BOLD}Reboot Now${NC} in the VM window."
+    while vm_is_running; do
+      [ "$(date +%s)" -lt "$deadline" ] || { warn "Timed out waiting for Reboot Now."; return 1; }
+      sleep 0.5
+    done
   fi
-
-  echo -e "${GREEN}[   ok  ]${NC} Omarchy installed${user:+ for $user}. Click ${BOLD}Reboot Now${NC} in the VM window."
-  while vm_is_running; do
-    [ "$(date +%s)" -lt "$deadline" ] || { warn "Timed out waiting for Reboot Now."; return 1; }
-    sleep 0.5
-  done
   vm_close_viewer
 
-  # Boot the installed system ourselves (the live --live action is gone now).
+  # Boot the installed system ourselves after the intercepted reboot.
   vm_start >/dev/null
   if [ "$AUTO_ENCRYPT" = "1" ] && [ -z "$UNLOCK_KEY" ]; then
     vm_open_viewer
@@ -340,7 +383,7 @@ auto_provision_guest() {
     # verifypw=any lets the `sudo -v` calls in omarchy update pass too, and a
     # transient timer revokes it after an hour even if this host process dies.
     if [ -z "$pw" ]; then
-      read -r -s -p "Password you set for $user in the installer (for setup's sudo): " pw; echo
+      read -r -s -p "Password you set for $user in the installer (for setup's sudo): " pw </dev/tty; echo
     fi
     say "Granting temporary sudo for guest setup..."
     printf '%s\n' "$pw" | vm_guest_ssh "sudo -S -p '' sh -c '
@@ -376,31 +419,91 @@ UNLOCK_SERIAL="omvmunlock"
 # Omarchy boots through mkinitcpio's encrypt hook, which reads a raw key from a
 # block device given as device:offset:length, and falls back to the passphrase
 # prompt when the key is missing or wrong.
-UNLOCK_PARAM="cryptkey=/dev/disk/by-id/virtio-$UNLOCK_SERIAL:0:64"
+# The encrypted root is unlocked in mkinitcpio's early userspace, before the
+# normal udev by-id links are guaranteed to exist. The temporary raw key disk
+# is attached as the second virtio block device, so use its stable guest block
+# name directly for this one boot.
+UNLOCK_PARAM="cryptkey=/dev/vdb:0:64"
 
 # In the live ISO, with the new system still mounted: add a random one-time key
 # to the LUKS volume (authorized with the passphrase from the installer's
-# answers), add UNLOCK_PARAM to the boot entries, and attach a tiny disk holding
-# the key for the next start. Sets UNLOCK_KEY.
+# answers or terminal prompt), add UNLOCK_PARAM to the boot entries, and attach a
+# tiny disk holding the key for the next start. Sets UNLOCK_KEY.
 auto_seed_unlock_key() {
+  local user="${OMARCHY_GUEST_USER:-$AUTO_USER}"
+  local pw="${AUTO_PASSWORD:-}"
+  if [ -z "$pw" ]; then
+    pw="$(vm_agent_sh 'jq -j ".encryption_password // empty" /root/user_credentials.json' 2>/dev/null || true)"
+  fi
+  if [ -n "$pw" ]; then
+    say "Using cached installer password for first-boot disk unlock..."
+  else
+    echo -e "${YELLOW}Disk encryption detected.${NC}"
+    while true; do
+      read -r -s -p "Password for ${user:-Omarchy} (to unlock disk on first boot): " pw </dev/tty; echo
+      [ -n "$pw" ] && break
+      warn "Password cannot be empty."
+    done
+    AUTO_PASSWORD="$pw"
+  fi
+
   local key
   key="$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+  local stdin_data
+  printf -v stdin_data '%s\n%s\n' "$pw" "$key"
+
+  # Wait for guest agent to remain responsive (installer may be shutting down)
+  for _ in $(seq 1 "${FIT_WAIT:-120}"); do
+    if vm_agent_up && vm_agent_sh 'mountpoint -q /mnt' >/dev/null 2>&1; then
+      break
+    fi
+    sleep 1
+  done
+  if ! vm_agent_up; then
+    warn "Guest agent is not responding; cannot set up automatic unlock."
+    return 1
+  fi
+
+  local rc=0
+  # Shell tracing would print both the passphrase and one-time key to the host log.
   vm_agent_sh "set -e
     umask 077
-    cat > /tmp/omvm.key
+    IFS= read -r pw || [ -n \"\$pw\" ]
+    IFS= read -r key || [ -n \"\$key\" ]
+    if [ -z \"\$pw\" ]; then
+      echo 'error: empty disk password received' >&2
+      exit 1
+    fi
+    printf '%s' \"\$key\" > /tmp/omvm.key
     dev=\$(lsblk -rno PATH,FSTYPE | awk '\$2 == \"crypto_LUKS\" { print \$1; exit }')
-    [ -n \"\$dev\" ]
-    jq -j '.encryption_password // empty' /root/user_credentials.json \\
-      | cryptsetup luksAddKey --batch-mode --key-file=- --pbkdf pbkdf2 --pbkdf-force-iterations 1000 \"\$dev\" /tmp/omvm.key
+    [ -n \"\$dev\" ] || dev=\$(blkid -t TYPE=crypto_LUKS -o device 2>/dev/null | head -1)
+    if [ -z \"\$dev\" ]; then
+      echo 'error: no crypto_LUKS partition found' >&2
+      exit 1
+    fi
+    printf '%s' \"\$pw\" | cryptsetup luksAddKey --batch-mode --key-file=- --pbkdf pbkdf2 --pbkdf-force-iterations 1000 \"\$dev\" /tmp/omvm.key
     rm -f /tmp/omvm.key
+
+    # The Omarchy installer always boots with Limine from /boot/limine.conf.
     sed -i -E 's#^([[:space:]]*(kernel_)?cmdline:.*)\$#\\1 $UNLOCK_PARAM#' /mnt/boot/limine.conf
-    grep -q '$UNLOCK_PARAM' /mnt/boot/limine.conf" "$key" >/dev/null 2>"$IMAGE_DIR/unlock.err" \
-    || { warn "Unlock key setup failed: $(tail -3 "$IMAGE_DIR/unlock.err" | tr '\n' ' ')"; rm -f "$IMAGE_DIR/unlock.err"; return 1; }
+    grep -q '$UNLOCK_PARAM' /mnt/boot/limine.conf" "$stdin_data" >/dev/null 2>"$IMAGE_DIR/unlock.err" || rc=$?
+
+  if [ "$rc" -ne 0 ]; then
+    local err
+    err="$(cat "$IMAGE_DIR/unlock.err" 2>/dev/null | tr '\n' ' ' | sed 's/  */ /g;s/^ //;s/ $//')"
+    warn "Unlock key setup failed: ${err:-guest command failed with exit code $rc and no output}"
+    rm -f "$IMAGE_DIR/unlock.err"
+    return 1
+  fi
   rm -f "$IMAGE_DIR/unlock.err"
 
   ( umask 077; printf '%s' "$key" > "$UNLOCK_IMG"; truncate -s 1M "$UNLOCK_IMG" )
-  virsh -c "$URI" attach-disk "$DOMAIN" "$UNLOCK_IMG" vdb --targetbus virtio --subdriver raw \
-    --serial "$UNLOCK_SERIAL" --config >/dev/null || { warn "Could not attach the unlock key disk."; rm -f "$UNLOCK_IMG"; return 1; }
+  local attach_err
+  if ! attach_err="$(virsh -c "$URI" attach-disk "$DOMAIN" "$UNLOCK_IMG" vdb --targetbus virtio --subdriver raw --serial "$UNLOCK_SERIAL" --config 2>&1)"; then
+    warn "Could not attach the unlock key disk: $attach_err"
+    rm -f "$UNLOCK_IMG"
+    return 1
+  fi
   UNLOCK_KEY="$key"
   ok "Disk set to unlock automatically on the first boot."
 }
@@ -412,8 +515,9 @@ auto_remove_unlock_key() {
   vm_guest_ssh 'sudo sh -s' >/dev/null <<EOF || warn "Could not remove the one-time unlock key from the guest."
 set -e
 dev=\$(lsblk -rno PATH,FSTYPE | awk '\$2 == "crypto_LUKS" { print \$1; exit }')
-printf '%s' '$UNLOCK_KEY' | cryptsetup luksRemoveKey --batch-mode --key-file=- "\$dev"
-sed -i 's# $UNLOCK_PARAM##' /boot/limine.conf
+[ -n "\$dev" ] || dev=\$(blkid -t TYPE=crypto_LUKS -o device 2>/dev/null | head -1)
+[ -n "\$dev" ] && printf '%s' '$UNLOCK_KEY' | cryptsetup luksRemoveKey --batch-mode --key-file=- "\$dev" || true
+sed -i 's# $UNLOCK_PARAM##g' /boot/limine.conf
 EOF
   local flags=(--config)
   vm_is_running && flags=(--live --config)

@@ -63,13 +63,28 @@ def agent(cmd):
     r = subprocess.run(["virsh", "-c", uri, "qemu-agent-command", dom, json.dumps(cmd)],
                        capture_output=True, text=True)
     if r.returncode:
+        err = r.stderr.strip() if r.stderr else f"virsh qemu-agent-command failed (code {r.returncode})"
+        sys.stderr.write(err + "\n")
         sys.exit(125)
-    return json.loads(r.stdout)["return"]
+    try:
+        data = json.loads(r.stdout)
+    except Exception as e:
+        sys.stderr.write(f"invalid agent response: {r.stdout}\n")
+        sys.exit(125)
+    if "error" in data:
+        desc = data["error"].get("desc", str(data["error"]))
+        sys.stderr.write(f"agent error: {desc}\n")
+        sys.exit(125)
+    return data.get("return", {})
 
 args = {"path": "/bin/sh", "arg": ["-c", script], "capture-output": True}
 if stdin:
     args["input-data"] = base64.b64encode(stdin.encode()).decode()
-pid = agent({"execute": "guest-exec", "arguments": args})["pid"]
+res = agent({"execute": "guest-exec", "arguments": args})
+pid = res.get("pid")
+if not pid:
+    sys.stderr.write("guest-exec failed: no pid returned\n")
+    sys.exit(125)
 while not (status := agent({"execute": "guest-exec-status", "arguments": {"pid": pid}})).get("exited"):
     time.sleep(0.2)
 sys.stdout.write(base64.b64decode(status.get("out-data", "")).decode(errors="replace"))
