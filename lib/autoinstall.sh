@@ -209,9 +209,9 @@ guided_alive() {
 # Full installer experience (--full-exp): the user goes through Omarchy's own
 # installer in the VM window. Meanwhile the host, as root in the live ISO via its
 # guest agent, hands the installer our SSH key and, once it finishes, seeds a
-# temporary sudo grant into the still-mounted target. When the user clicks
-# Reboot Now the window closes, setup runs here, and the window reopens on the
-# finished desktop.
+# temporary sudo grant into the still-mounted target. Reboot Now is turned into
+# a power-off, so the click closes the window at once; the host then boots the
+# VM out of sight, runs setup, and opens the window on the finished desktop.
 auto_guided_install() {
   local deadline=$(( $(date +%s) + PROVISION_TIMEOUT )) seen_installer=0 user="" encrypted=""
 
@@ -233,13 +233,18 @@ auto_guided_install() {
   vm_agent_sh 'umask 077; cat > /root/authorized_keys' "$(cat "$PUBKEY")" >/dev/null \
     || { warn "Could not hand the SSH key to the installer."; return 1; }
   ok "Host SSH key handed to the installer."
+  # For this run only (--live), a guest reboot powers the VM off instead.
+  virsh -c "$URI" set-lifecycle-action "$DOMAIN" reboot destroy --live >/dev/null \
+    || warn "Could not hold the VM at Reboot Now; it will reboot in the window."
 
   # The install is done when its orchestrator exits (the target stays mounted).
   # The wizard's answers are on disk once it starts, so read them right then:
   # by the time it exits, a Reboot Now click may already be on its way.
   say "Waiting for the installation to finish..."
   while true; do
-    guided_alive "$deadline" || { warn "Timed out waiting for the installer."; return 1; }
+    [ "$(date +%s)" -lt "$deadline" ] || { warn "Timed out waiting for the installer."; return 1; }
+    # Already powered off: Reboot Now came before we saw the installer exit.
+    vm_is_running || break
     if vm_agent_sh 'pgrep -f "[o]rchestrator.main" >/dev/null' >/dev/null 2>&1; then
       if [ "$seen_installer" -eq 0 ]; then
         seen_installer=1
@@ -275,16 +280,19 @@ auto_guided_install() {
   fi
 
   echo -e "${GREEN}[   ok  ]${NC} Omarchy installed${user:+ for $user}. Click ${BOLD}Reboot Now${NC} in the VM window."
-  # The live ISO's agent goes away as the VM reboots: close the window then.
-  while vm_agent_up; do
-    guided_alive "$deadline" || { warn "Timed out waiting for the reboot."; return 1; }
-    sleep 1
+  while vm_is_running; do
+    [ "$(date +%s)" -lt "$deadline" ] || { warn "Timed out waiting for Reboot Now."; return 1; }
+    sleep 0.5
   done
+  vm_close_viewer
+
+  # Boot the installed system ourselves (the live --live action is gone now).
+  vm_start >/dev/null
   if [ "$AUTO_ENCRYPT" = "1" ]; then
+    vm_open_viewer
     echo -e "${YELLOW}Unlock the disk with your password in the VM window when it asks.${NC}"
   else
-    vm_close_viewer
-    echo -e "\n${BOLD}${GREEN}Rebooting into Omarchy — finishing setup in the background; the window reopens when ready.${NC}"
+    echo -e "\n${BOLD}${GREEN}Booting Omarchy and finishing setup in the background — the window opens when ready.${NC}"
   fi
 
   [ -n "${OMARCHY_GUEST_USER:-}" ] || { warn "Could not read the username from the installer."; return 1; }

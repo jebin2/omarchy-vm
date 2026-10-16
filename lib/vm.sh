@@ -31,7 +31,7 @@ vm_purge() {
   if vm_is_running; then
     virsh -c "$URI" destroy "$DOMAIN" >/dev/null 2>&1 || die "Could not power off '$DOMAIN'; refusing to delete its disk."
   fi
-  pkill -f "virt-viewer.*$DOMAIN" 2>/dev/null || true
+  pkill -f "(^|/)virt-viewer -c .* -a $DOMAIN$" 2>/dev/null || true
   if virsh -c "$URI" dominfo "$DOMAIN" >/dev/null 2>&1; then
     virsh -c "$URI" undefine "$DOMAIN" --nvram >/dev/null 2>&1 \
       || virsh -c "$URI" undefine "$DOMAIN" --keep-nvram >/dev/null 2>&1 \
@@ -78,7 +78,7 @@ PY
 }
 
 vm_close_viewer() {
-  pkill -f "virt-viewer.*$DOMAIN" 2>/dev/null || true
+  pkill -f "(^|/)virt-viewer -c .* -a $DOMAIN$" 2>/dev/null || true
 }
 
 vm_start() {
@@ -189,7 +189,7 @@ vm_clipboard_status() {
   local chan
   chan="$(virsh -c "$URI" dumpxml "$DOMAIN" | grep -A1 "channel type='spicevmc'" | grep -o "state='[a-z]*'" | cut -d"'" -f2 || true)"
   echo "Host SPICE channel:  ${chan:-missing}"
-  pgrep -f "virt-viewer.*$DOMAIN" >/dev/null && echo "virt-viewer:         open" \
+  pgrep -f "(^|/)virt-viewer -c .* -a $DOMAIN$" >/dev/null && echo "virt-viewer:         open" \
     || echo "virt-viewer:         not open (clipboard sharing needs it: omarchy open)"
 
   local env='export XDG_RUNTIME_DIR=/run/user/$(id -u);'

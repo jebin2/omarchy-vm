@@ -12,7 +12,7 @@ source "$SCRIPT_DIR/lib/vm.sh"
 source "$SCRIPT_DIR/lib/autoinstall.sh"
 
 viewer_running() {
-  pgrep -f "virt-viewer.*$DOMAIN" >/dev/null 2>&1
+  pgrep -f "(^|/)virt-viewer -c .* -a $DOMAIN$" >/dev/null 2>&1
 }
 
 vm_defined() {
