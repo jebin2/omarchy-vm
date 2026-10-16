@@ -38,6 +38,22 @@ detect_dependencies() {
   ok "All host dependencies verified."
 }
 
+# Tools only the hands-free install needs: xorriso builds the CIDATA drive,
+# openssl hashes the account password the way the Omarchy configurator does.
+detect_autoinstall_deps() {
+  command -v xorriso >/dev/null 2>&1 && command -v openssl >/dev/null 2>&1 && return 0
+  say "Installing autoinstall tools (xorriso, openssl)..."
+  if command -v pacman >/dev/null 2>&1; then
+    sudo pacman -S --needed --noconfirm libisoburn openssl
+  elif command -v dnf >/dev/null 2>&1; then
+    sudo dnf install -y xorriso openssl
+  elif command -v apt-get >/dev/null 2>&1; then
+    sudo apt-get install -y xorriso openssl
+  fi
+  command -v xorriso >/dev/null 2>&1 && command -v openssl >/dev/null 2>&1 \
+    || die "Hands-free install needs xorriso and openssl (or run: ./setup.sh --manual)."
+}
+
 detect_kvm() {
   [ -e /dev/kvm ] || die "/dev/kvm not found. Enable hardware virtualization (VT-x/AMD-V) in BIOS."
   if [ ! -r /dev/kvm ] || [ ! -w /dev/kvm ]; then
@@ -158,27 +174,53 @@ detect_ssh_key() {
   ok "SSH Key: $PUBKEY"
 }
 
+# Newest ISO URL linked from omarchy.org (empty when offline or unparseable).
+latest_iso_url() {
+  curl -fsSL --max-time 15 https://omarchy.org/ 2>/dev/null \
+    | grep -oE 'https://iso\.omarchy\.org/omarchy-[0-9][0-9.]*\.iso' | sort -uV | tail -1 || true
+}
+
+# Check an ISO against its published .sha256 (skipped when it can't be fetched).
+verify_iso() {
+  local iso="$1" url="$2" want have
+  want="$(curl -fsSL --max-time 15 "$url.sha256" 2>/dev/null | awk '{ print $1; exit }')" || true
+  [ -n "$want" ] || { warn "Could not fetch checksum for $(basename "$iso"); skipping verification."; return 0; }
+  say "Verifying $(basename "$iso") checksum..."
+  have="$(sha256sum "$iso" | awk '{ print $1 }')"
+  [ "$have" = "$want" ]
+}
+
+# Sets ISO: the given path, else the latest release (downloaded once into the
+# repo), else the newest ISO already on disk when omarchy.org is unreachable.
 detect_iso() {
-  local custom="${1:-}"
+  local custom="${1:-}" url name target
   ISO=""
-  if [ -n "$custom" ] && [ -f "$custom" ]; then
+  if [ -n "$custom" ]; then
+    [ -f "$custom" ] || die "ISO not found: $custom"
     ISO="$(realpath "$custom")"
-  else
-    local latest="$(ls -v "$ROOT_DIR"/omarchy-*.iso 2>/dev/null | tail -1 || true)"
-    [ -n "$latest" ] && [ -f "$latest" ] && ISO="$(realpath "$latest")"
+    ok "Using ISO: $(basename "$ISO") ($(du -h "$ISO" | cut -f1))"
+    return 0
   fi
 
-  if [ -z "$ISO" ] || [ ! -f "$ISO" ]; then
-    local target="$ROOT_DIR/omarchy-4.0.4.iso"
-    say "No Omarchy ISO found in $ROOT_DIR."
-    read -r -p "Download Omarchy ISO (~6 GB) now? [Y/n]: " ans
-    if [[ "$ans" =~ ^[Nn] ]]; then
-      die "An Omarchy ISO is required. Place one in $ROOT_DIR or run with --iso /path/to/omarchy.iso"
-    fi
-    say "Downloading official Omarchy ISO..."
-    curl -C - -L -o "$target" "https://iso.omarchy.org/omarchy-4.0.4.iso" || \
-      die "Download failed. Check your network connection."
-    ISO="$target"
+  say "Looking up the latest Omarchy ISO..."
+  url="$(latest_iso_url)"
+  if [ -z "$url" ]; then
+    ISO="$(ls -v "$ROOT_DIR"/omarchy-*.iso 2>/dev/null | tail -1 || true)"
+    [ -n "$ISO" ] || die "Could not reach omarchy.org to find the latest ISO. Pass one: omarchy install /path/to/omarchy.iso"
+    warn "omarchy.org unreachable; using local $(basename "$ISO")."
+    return 0
   fi
-  ok "Using ISO: $(basename "$ISO") ($(du -h "$ISO" | cut -f1))"
+
+  name="$(basename "$url")"
+  target="$ROOT_DIR/$name"
+  if [ -f "$target" ]; then
+    ok "Latest ISO already downloaded: $name"
+  else
+    say "Downloading $name (~6 GB)..."
+    curl -fL -C - --retry 3 -o "$target.part" "$url" || die "Download failed (re-run to resume)."
+    verify_iso "$target.part" "$url" || { rm -f "$target.part"; die "Checksum mismatch for $name; deleted the download. Re-run to retry."; }
+    mv "$target.part" "$target"
+    ok "Downloaded and verified $name."
+  fi
+  ISO="$target"
 }

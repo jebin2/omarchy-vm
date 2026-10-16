@@ -6,76 +6,41 @@ Features near-native **virgl 3D OpenGL acceleration**, **SPICE low-latency displ
 
 ---
 
-## ⚡ Quick Start (One Command Setup)
-
-### 1. Run Setup on Host
-Clone this repo and run the automated setup engine:
+## ⚡ Quick Start
 
 ```bash
-cd ~/omarchy-vm
-./setup.sh
+git clone <this repo> ~/omarchy-vm
+~/omarchy-vm/omarchy install
 ```
 
-`setup.sh` automatically:
-- Checks and offers to install required packages (`qemu`, `libvirt`, `virt-viewer`, `edk2-ovmf`, `python3`, `curl`).
-- Starts libvirt user session services (`virtqemud.socket`).
-- Inspects GPU render nodes and binds **Intel/AMD virgl** (safely skipping NVIDIA to avoid driver freezes).
-- Auto-locates OVMF UEFI firmware and the Omarchy ISO.
-- Creates a 40 GB sparse virtual disk (`images/omarchy.qcow2`).
-- Synthesizes the libvirt domain XML and defines `omarchy-vm`.
-- Installs the KDE/GNOME application shortcut and `~/.local/bin/omarchy` CLI command.
-- Starts the local provisioning server and launches the VM in `virt-viewer`.
+Choose a username and password when asked, and that's all the input it needs. It downloads the latest Omarchy ISO, installs it hands-free, sets it up, and opens it fullscreen on your desktop.
 
-### 2. Complete Guest Installation & Onboarding
-1. Follow the standard Omarchy graphical installer in the `virt-viewer` window.
-2. Once installed, reboot into the installed system.
-3. Open a terminal in Omarchy (**Super + Enter** or launch `foot`) and paste:
+## 🕹️ Commands
 
-```bash
-bash <(curl -fsSL http://10.0.2.2:8765)
-```
-
-(If you set `OMARCHY_PROVISION_PORT` on the host, use that port instead — the host prints the exact command.)
-
-This single command automatically:
-- Installs guest packages (`openssh`, `qemu-guest-agent`, `spice-vdagent`, `wl-clipboard`, `xclip`, `clipnotify`).
-- Enables `sshd`, guest agent, and the clipboard bridge service.
-- Authorizes your host's SSH key.
-- Applies the software cursor workaround for SPICE.
-- Signals the host, which automatically resizes the guest screen to match your monitor resolution.
-
----
-
-## 🕹️ Unified Control CLI (`omarchy`)
-
-Once installed, manage the VM using `./omarchy` or the global shortcut `omarchy`:
-
-```bash
-omarchy <command>
-```
-
-| Command | Action |
+| Command | What it does |
 | :--- | :--- |
-| `up` | Start the VM and open the screen in `virt-viewer` (fullscreen) |
-| `open` | Open the SPICE display in `virt-viewer` |
-| `ssh` | Connect directly into the VM via SSH (`127.0.0.1:2222`) |
-| `stop` / `down` | Clean shutdown (Guest Agent → ACPI → Force) |
-| `force-stop` | Immediate power off (`virsh destroy`) |
-| `fit [RES]` | Match guest screen to host resolution (or custom `RES`, e.g. `1920x1080`) |
-| `toggle` | Start and open the display if off, otherwise shut down |
-| `status` | Print VM state, guest agent, SSH command, and installer ISO state |
-| `eject` | Eject the installer ISO from the VM configuration |
-| `reset` | Backup existing virtual disk and launch a clean reinstall |
-| `clipboard [-f]` | Check host↔guest clipboard sharing and show (or `-f` follow live) the bridge log |
-| `setup ISO --no-backup` | Fresh install: permanently delete any existing VM (no backup, asks to type `PURGE`; `-y` skips), then install |
-| `setup --finish` | Shut down, eject the installer ISO, and boot the installed system |
-| `provision` | Re-run the host provisioning server for the guest setup script |
+| `omarchy install [ISO]` | Create the VM and install Omarchy hands-free. Downloads and verifies the latest ISO from omarchy.org unless you pass one |
+| `omarchy open` | Start the VM (if needed) and open its window |
+| `omarchy stop` | Shut the VM down cleanly (guest agent → ACPI → force) |
+| `omarchy reset [ISO]` | Erase the VM and install Omarchy again from scratch |
+| `omarchy delete` | Erase the VM completely (disk, firmware state, app launcher entry). The `omarchy` command and downloaded ISOs are kept |
 
-Re-running `./setup.sh` on an existing install refreshes the VM configuration without re-attaching the installer ISO.
+`reset` and `delete` ask before erasing anything; `-y` skips the prompt. `install --manual` uses the interactive Omarchy installer instead of the hands-free one. `OMARCHY_ENCRYPT=1 omarchy install` creates an encrypted disk, which you unlock in the VM window at each boot.
 
-If another `omarchy` command already exists on your `PATH` (e.g. on an Omarchy host), the `~/.local/bin/omarchy` shortcut is skipped — use `./omarchy` from the repo instead.
+After the first install, `omarchy` is on your `PATH` (`~/.local/bin/omarchy`), and **"Omarchy VM"** shows up in your app launcher. On an Omarchy host, which has its own `omarchy` command, the shortcut is skipped; run `~/omarchy-vm/omarchy` instead.
 
-You can also launch **"Omarchy VM"** directly from your desktop application launcher (KDE / GNOME / Rofi).
+SSH into the guest: `ssh -p 2222 <user>@127.0.0.1` (your host key is already authorized).
+
+### What `install` does
+- Checks and offers to install the host packages it needs (`qemu`, `libvirt`, `virt-viewer`, `edk2-ovmf`, `python3`, `curl`, `xorriso`, `openssl`).
+- Starts the libvirt user session (`virtqemud.socket`); no root is needed day to day.
+- Binds **Intel/AMD virgl** 3D acceleration, skipping NVIDIA to avoid driver freezes.
+- Creates a 40 GB sparse disk (`images/omarchy.qcow2`) and defines the `omarchy-vm` domain.
+- **Installs Omarchy unattended** through the ISO's built-in autoinstall. The installer answers ride on a small `CIDATA`-labeled drive, the same mechanism Omarchy uses for headless installs, and the installer authorizes your host SSH key.
+- **Provisions the guest over SSH**: `omarchy update -y`, guest tools (`qemu-guest-agent`, `spice-vdagent`, `wl-clipboard`, `xclip`, `clipnotify`), the clipboard bridge, the SPICE cursor fix and desktop autologin.
+- Reboots the guest and fits its screen to your monitor.
+
+Sudo inside the guest uses a temporary passwordless grant. It is revoked when setup finishes and expires on its own after an hour. The installer drive holds a hash of your password and is deleted once the install completes. If the hands-free path stops partway, `install` falls back to the manual steps: run `bash <(curl -fsSL http://10.0.2.2:8765)` in a guest terminal.
 
 ---
 
@@ -95,13 +60,13 @@ You can also launch **"Omarchy VM"** directly from your desktop application laun
 
 ```
 omarchy-vm/
-├── omarchy                  # Unified control CLI & setup engine
-├── setup.sh                 # One-command setup entry point (./omarchy setup)
+├── omarchy                  # CLI: install, open, stop, reset, delete
 │
 ├── lib/                     # Modular host-side libraries
 │   ├── common.sh            # Global paths, constants, and logging helpers
 │   ├── detect.sh            # System, hardware, and dependency auto-detection
 │   ├── vm.sh                # Libvirt domain XML synthesis & lifecycle control
+│   ├── autoinstall.sh       # Hands-free install (CIDATA drive) & SSH-driven guest setup
 │   └── provisioner.py       # Standalone local HTTP provisioning server
 │
 ├── guest/                   # In-guest onboarding assets

@@ -37,7 +37,7 @@ vm_purge() {
       || virsh -c "$URI" undefine "$DOMAIN" --keep-nvram >/dev/null 2>&1 \
       || die "Could not undefine domain '$DOMAIN'."
   fi
-  rm -f "$DISK" "$NVRAM_PATH" "$GUEST_USER_FILE" "$DOMAIN_XML"
+  rm -f "$DISK" "$NVRAM_PATH" "$GUEST_USER_FILE" "$DOMAIN_XML" "$IMAGE_DIR/cidata.iso"
   ok "Old VM removed (domain, disk, NVRAM, provisioning state)."
 }
 
@@ -55,7 +55,7 @@ vm_start() {
   local s rc=0
   s="$(vm_state 2>/dev/null)" || rc=$?
   if [ $rc -eq 1 ]; then
-    die "VM '$DOMAIN' is not defined. Run 'omarchy setup' first."
+    die "VM '$DOMAIN' is not defined. Run 'omarchy install' first."
   elif [ $rc -eq 2 ]; then
     die "Cannot connect to hypervisor ($URI). Check your libvirt service."
   elif [ "$s" = "running" ]; then
@@ -117,7 +117,7 @@ vm_force_stop() {
 }
 
 vm_open_viewer() {
-  vm_is_running || die "VM is not running. Start it with: omarchy start"
+  vm_is_running || die "VM is not running. Start it with: omarchy open"
   command -v virt-viewer >/dev/null 2>&1 || die "virt-viewer not installed (sudo pacman -S virt-viewer)"
 
   # Schedule auto-fit in background once guest agent boots
@@ -152,7 +152,7 @@ vm_guest_ssh() {
 # Clipboard health: host SPICE channel, guest agents/bridge, and bridge log.
 # With -f/--follow, streams the bridge log live.
 vm_clipboard_status() {
-  vm_is_running || die "VM is not running. Start it with: omarchy up"
+  vm_is_running || die "VM is not running. Start it with: omarchy open"
   local follow=0
   case "${1:-}" in -f|--follow) follow=1 ;; esac
 
@@ -226,7 +226,7 @@ HYPRLAND_INSTANCE_SIGNATURE=\$sig hyprctl eval 'hl.monitor({ output = \"Virtual-
 # Path of the ISO currently in the CD-ROM drive, or empty if ejected.
 vm_current_iso() {
   virsh -c "$URI" domblklist "$DOMAIN" --details 2>/dev/null \
-    | awk '$2 == "cdrom" && $4 != "-" { print $4; exit }'
+    | awk '$3 == "sda" && $4 != "-" { print $4; exit }'
 }
 
 vm_eject_iso() {
@@ -267,6 +267,15 @@ vm_synthesize_xml() {
   # Empty ISO means an ejected (empty) CD-ROM drive.
   local cdrom_source=""
   [ -n "${ISO:-}" ] && cdrom_source="<source file=\"$ISO\" />"
+
+  # Autoinstall answers ride on a second CD-ROM labeled CIDATA.
+  local cidata_disk=""
+  [ -n "${CIDATA:-}" ] && cidata_disk="<disk type=\"file\" device=\"cdrom\">
+      <driver name=\"qemu\" type=\"raw\" />
+      <source file=\"$CIDATA\" />
+      <target dev=\"sdb\" bus=\"sata\" />
+      <readonly />
+    </disk>"
 
   local emulator
   emulator="$(command -v qemu-system-x86_64 || echo /usr/bin/qemu-system-x86_64)"
@@ -318,6 +327,7 @@ vm_synthesize_xml() {
       <readonly />
       <boot order="2" />
     </disk>
+    $cidata_disk
     <controller type="usb" index="0" model="qemu-xhci" />
     <controller type="sata" index="0" />
     <controller type="pci" index="0" model="pcie-root" />
@@ -372,35 +382,15 @@ Type=Application
 Name=Omarchy VM
 GenericName=Omarchy Virtual Machine
 Comment=Run Omarchy Arch/Hyprland Linux VM
-Exec=$ROOT_DIR/omarchy up
+Exec=$ROOT_DIR/omarchy open
 Icon=computer
-Terminal=true
+Terminal=false
 Categories=System;Utility;
-Actions=Start;Stop;Open;ForceStop;Status;SSH;
-
-[Desktop Action Start]
-Name=Start & Open
-Exec=$ROOT_DIR/omarchy up
+Actions=Stop;
 
 [Desktop Action Stop]
 Name=Shut Down
 Exec=$ROOT_DIR/omarchy stop
-
-[Desktop Action Open]
-Name=Open Screen (virt-viewer)
-Exec=$ROOT_DIR/omarchy open
-
-[Desktop Action ForceStop]
-Name=Force Off
-Exec=$ROOT_DIR/omarchy force-stop
-
-[Desktop Action Status]
-Name=Show Status
-Exec=$ROOT_DIR/omarchy status
-
-[Desktop Action SSH]
-Name=SSH Connect
-Exec=$ROOT_DIR/omarchy ssh
 EOF
 
   ok "Desktop entry installed."
@@ -416,4 +406,10 @@ EOF
     ln -sfn "$ROOT_DIR/omarchy" "$link"
     ok "CLI shortcut installed: $link"
   fi
+}
+
+# The launcher entry only opens a VM, so it goes with the VM. The CLI link stays:
+# it is the tool itself, and 'omarchy install' must still work afterwards.
+vm_remove_desktop_entry() {
+  rm -f "$HOME/.local/share/applications/omarchy-vm.desktop"
 }

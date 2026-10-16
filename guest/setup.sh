@@ -17,7 +17,11 @@ say() { echo "[guest-setup] $*"; }
 # through `omarchy update`; prompts read from the terminal so a piped
 # `curl | bash` cannot have the rest of this script swallowed as input.
 # Never `pacman -Sy` alone: syncing without upgrading is an unsupported partial upgrade.
-if command -v omarchy >/dev/null 2>&1; then
+# OMARCHY_VM_UNATTENDED=1 is set when the host drives this over SSH (no terminal).
+if command -v omarchy >/dev/null 2>&1 && [ "${OMARCHY_VM_UNATTENDED:-}" = "1" ]; then
+  say "Updating system via omarchy update -y..."
+  omarchy update -y </dev/null || say "omarchy update failed; continuing with package install"
+elif command -v omarchy >/dev/null 2>&1; then
   say "Updating system via omarchy update (decline any reboot until this finishes)..."
   omarchy update </dev/tty || say "omarchy update failed; continuing with package install"
 else
@@ -71,6 +75,14 @@ if [ -f "$LOOKNFEEL" ]; then
     printf '\n-- QEMU virtio-gpu cursor plane workaround for SPICE.\nhl.config({ cursor = { no_hardware_cursors = true } })\n' >> "$LOOKNFEEL"
   fi
   hyprctl reload >/dev/null 2>&1 || true
+fi
+
+# Unencrypted installs stop at the SDDM login screen; inside a VM window that is
+# one password too many, so log straight in like an encrypted install does.
+if [ "${OMARCHY_VM_UNATTENDED:-}" = "1" ] && [ ! -f /etc/sddm.conf.d/autologin.conf ]; then
+  say "Enabling desktop autologin..."
+  printf '[Autologin]\nUser=%s\nSession=omarchy.desktop\n' "$USER" \
+    | sudo install -Dm644 /dev/stdin /etc/sddm.conf.d/autologin.conf
 fi
 
 # Notify host provisioner
