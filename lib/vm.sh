@@ -51,6 +51,31 @@ vm_agent_up() {
   virsh -c "$URI" qemu-agent-command "$DOMAIN" '{"execute":"guest-ping"}' >/dev/null 2>&1
 }
 
+# Upgrade domains created by older versions, which explicitly disabled audio.
+# PipeWire on the host commonly exposes a PulseAudio-compatible server, so the
+# QEMU PulseAudio backend works with both PipeWire and PulseAudio hosts.
+vm_enable_audio() {
+  local current_xml updated_xml runtime_dir
+  runtime_dir="/run/user/$(id -u)"
+  current_xml="$(virsh -c "$URI" dumpxml --inactive "$DOMAIN")"
+  if ! grep -Eq "<audio[^>]*type=['\"]none['\"]" <<<"$current_xml" \
+      && grep -Eq "<qemu:env[^>]*name=['\"]XDG_RUNTIME_DIR['\"]" <<<"$current_xml"; then
+    return 0
+  fi
+
+  updated_xml="$(python3 -c 'import re,sys; s=sys.stdin.read(); runtime_dir=sys.argv[1]; pattern=r"<audio\b(?=[^>]*\bid=[\x27\"]1[\x27\"])(?=[^>]*\btype=[\x27\"]none[\x27\"])[^>]*/>"; new="<audio id=\"1\" type=\"pulseaudio\" />\n    <sound model=\"ich9\"><audio id=\"1\" /></sound>"; s=re.sub(pattern, lambda _: new, s, count=1); env=r"<qemu:env\b(?=[^>]*\bname=[\x27\"]XDG_RUNTIME_DIR[\x27\"])[^>]*/>"; s=re.sub(env, lambda _: "", s, count=1); s,n=re.subn(r"(<qemu:commandline>)", lambda m: m.group(1)+"\n    <qemu:env name=\"XDG_RUNTIME_DIR\" value=\""+runtime_dir+"\" />", s, count=1); assert n == 1, "QEMU commandline not found"; print(s, end="")' "$runtime_dir" <<<"$current_xml")" \
+    || die "Could not prepare the VM audio configuration."
+  local xml_file
+  xml_file="$(mktemp)"
+  printf '%s\n' "$updated_xml" > "$xml_file"
+  if ! virsh -c "$URI" define "$xml_file" >/dev/null; then
+    rm -f "$xml_file"
+    die "Could not enable audio in the VM configuration."
+  fi
+  rm -f "$xml_file"
+  ok "Enabled VM audio (PulseAudio-compatible host output)."
+}
+
 # Run a shell script as root in the guest through its agent, optionally feeding
 # it STDIN. Prints the script's stdout and returns its exit code (125 when the
 # agent itself is unreachable).
@@ -107,6 +132,7 @@ vm_start() {
   elif [ "$s" = "running" ]; then
     say "VM '$DOMAIN' is already running."
   else
+    vm_enable_audio
     say "Starting VM '$DOMAIN'..."
     virsh -c "$URI" start "$DOMAIN" >/dev/null
     ok "VM started."
@@ -302,6 +328,7 @@ vm_create_disk() {
 vm_synthesize_xml() {
   mkdir -p "$IMAGE_DIR"
   [ -f "$NVRAM_PATH" ] || cp "$OVMF_VARS" "$NVRAM_PATH"
+  local runtime_dir="/run/user/$(id -u)"
 
   local gl_graphics=""
   local video_device="<video><model type='virtio' heads='1' primary='yes'><acceleration accel3d='no'/></model></video>"
@@ -394,7 +421,8 @@ vm_synthesize_xml() {
       <listen type="address" address="127.0.0.1" />
     </graphics>
     $gl_graphics
-    <audio id="1" type="none" />
+    <audio id="1" type="pulseaudio" />
+    <sound model="ich9"><audio id="1" /></sound>
     $video_device
     <watchdog model="itco" action="reset" />
     <memballoon model="virtio" />
@@ -403,6 +431,7 @@ vm_synthesize_xml() {
     </rng>
   </devices>
   <qemu:commandline>
+    <qemu:env name="XDG_RUNTIME_DIR" value="$runtime_dir" />
     <qemu:arg value="-netdev" />
     <qemu:arg value="user,id=hostnet0,hostfwd=tcp:127.0.0.1:$SSH_PORT-:22" />
     <qemu:arg value="-device" />
