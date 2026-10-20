@@ -31,6 +31,12 @@ vm_purge() {
   if vm_is_running; then
     virsh -c "$URI" destroy "$DOMAIN" >/dev/null 2>&1 || die "Could not power off '$DOMAIN'; refusing to delete its disk."
   fi
+  # A VNC-configured VM means this host already needed the SPICE fallback.
+  # Preserve that host-level preference when --reset or delete recreates it.
+  if [ "$(vm_graphics_backend 2>/dev/null || true)" = vnc ]; then
+    mkdir -p "$IMAGE_DIR"
+    : > "$IMAGE_DIR/use-vnc"
+  fi
   pkill -f "(^|/)virt-viewer -c .* -a $DOMAIN$" 2>/dev/null || true
   if virsh -c "$URI" dominfo "$DOMAIN" >/dev/null 2>&1; then
     virsh -c "$URI" undefine "$DOMAIN" --nvram >/dev/null 2>&1 \
@@ -192,11 +198,109 @@ vm_open_viewer() {
   vm_is_running || die "VM is not running. Start it with: omarchy open"
   command -v virt-viewer >/dev/null 2>&1 || die "virt-viewer not installed (sudo pacman -S virt-viewer)"
 
+  if pgrep -f "(^|/)virt-viewer -c .* -a $DOMAIN$" >/dev/null 2>&1; then
+    say "Viewer is already open."
+    return 0
+  fi
+
   # Schedule auto-fit in background once guest agent boots
   nohup "$ROOT_DIR/omarchy" fit --wait >/dev/null 2>&1 &
 
-  say "Opening SPICE display in virt-viewer (Fullscreen; Ctrl+Alt+F to toggle)..."
-  nohup virt-viewer -c "$URI" -f -a "$DOMAIN" >/dev/null 2>&1 &
+  say "Opening VM display in virt-viewer (Fullscreen; Ctrl+Alt+F to toggle)..."
+  nohup "$ROOT_DIR/omarchy" _viewer-supervisor >/dev/null 2>&1 &
+}
+
+vm_viewer_supervisor() {
+  local viewer_log="$IMAGE_DIR/virt-viewer.log" status=0 viewer_pid state connected=0 i
+  : > "$viewer_log"
+
+  # The render messages below are emitted by the SPICE client. VNC does not
+  # emit them, so sending an already-VNC domain through that timeout would
+  # close its working viewer after 30 seconds.
+  if [ "$(vm_graphics_backend)" = vnc ]; then
+    exec env -u LD_PRELOAD -u LD_LIBRARY_PATH virt-viewer -c "$URI" -f -a "$DOMAIN" >>"$viewer_log" 2>&1
+  fi
+
+  env -u LD_PRELOAD -u LD_LIBRARY_PATH virt-viewer --debug --verbose -c "$URI" -f -a "$DOMAIN" >"$viewer_log" 2>&1 &
+  viewer_pid=$!
+
+  # The viewer can remain alive on its "connecting" page after the SPICE
+  # client has stopped making progress. Treat a rendered display as ready.
+  for i in $(seq 1 60); do
+    if grep -Eq 'notebook show display|desktop resize' "$viewer_log"; then
+      connected=1
+      break
+    fi
+    state="$(ps -o stat= -p "$viewer_pid" 2>/dev/null | tr -d '[:space:]')"
+    if [ -z "$state" ] || [[ "$state" == Z* ]]; then
+      wait "$viewer_pid" || status=$?
+      break
+    fi
+    sleep 0.5
+  done
+
+  if [ "$connected" -eq 1 ]; then
+    wait "$viewer_pid" || true
+    return 0
+  fi
+
+  if [ -n "$(ps -o stat= -p "$viewer_pid" 2>/dev/null | tr -d '[:space:]')" ]; then
+    printf 'virt-viewer did not render a display within 30 seconds; switching to fallback.\n' >>"$viewer_log"
+    kill -TERM "$viewer_pid" 2>/dev/null || true
+    wait "$viewer_pid" 2>/dev/null || true
+    status=124
+  fi
+
+  # Some spice-gtk builds crash or stall while initializing GStreamer. On a
+  # failed SPICE startup, switch the saved domain to VNC/standard VGA and retry.
+  vm_is_running || return "$status"
+  [ "$(vm_graphics_backend)" = spice ] || return "$status"
+  printf 'SPICE viewer exited with status %s; retrying with VNC and standard VGA.\n' "$status" >>"$viewer_log"
+  vm_switch_to_vnc || die "Could not switch the VM display to VNC. See $viewer_log."
+  exec env -u LD_PRELOAD -u LD_LIBRARY_PATH virt-viewer -c "$URI" -f -a "$DOMAIN" >>"$viewer_log" 2>&1
+}
+
+vm_graphics_backend() {
+  virsh -c "$URI" dumpxml --inactive "$DOMAIN" \
+    | python3 -c 'import sys,xml.etree.ElementTree as ET; root=ET.fromstring(sys.stdin.read()); nodes=root.findall("./devices/graphics"); print(next((node.get("type", "") for node in nodes if node.get("type") in {"spice", "vnc"}), ""))'
+}
+
+vm_switch_to_vnc() {
+  vm_stop
+
+  local xml_file
+  xml_file="$(mktemp)"
+  if ! virsh -c "$URI" dumpxml --inactive "$DOMAIN" \
+      | python3 -c 'import re,sys
+s=sys.stdin.read()
+graphics=r"<graphics\b(?=[^>]*\btype=[\x27\"]spice[\x27\"])[^>]*>.*?</graphics>"
+vnc="<graphics type=\x27vnc\x27 port=\x27-1\x27 autoport=\x27yes\x27 listen=\x27127.0.0.1\x27>\n      <listen type=\x27address\x27 address=\x27127.0.0.1\x27/>\n    </graphics>"
+s,n=re.subn(graphics,lambda _:vnc,s,count=1,flags=re.S)
+assert n==1,"SPICE graphics block not found"
+s,n=re.subn(r"\s*<graphics\b(?=[^>]*\btype=[\x27\"]egl-headless[\x27\"])[^>]*>.*?</graphics>","",s,count=1,flags=re.S)
+assert n<=1,"Unexpected number of EGL graphics blocks"
+s,n=re.subn(r"\s*<channel\b(?=[^>]*\btype=[\x27\"]spicevmc[\x27\"])[^>]*>.*?</channel>","",s,count=1,flags=re.S)
+assert n==1,"SPICE channel not found"
+video=r"<video>.*?</video>"
+def standard_vga(m):
+    address=re.search(r"<address\b[^>]*/>",m.group(0))
+    return "<video><model type=\x27vga\x27 heads=\x271\x27 primary=\x27yes\x27/>"+(address.group(0) if address else "")+"</video>"
+s,n=re.subn(video,standard_vga,s,count=1,flags=re.S)
+assert n==1,"Video device not found"
+sys.stdout.write(s)' >"$xml_file"; then
+    rm -f "$xml_file"
+    return 1
+  fi
+  if ! virsh -c "$URI" define "$xml_file" >/dev/null; then
+    rm -f "$xml_file"
+    return 1
+  fi
+  rm -f "$xml_file"
+  # Keep this choice across `omarchy delete`/`omarchy install`. The viewer
+  # fallback proved SPICE unusable on this host, so don't make it wait again.
+  mkdir -p "$IMAGE_DIR"
+  : > "$IMAGE_DIR/use-vnc"
+  vm_start
 }
 
 vm_connect_ssh() {
@@ -331,8 +435,15 @@ vm_synthesize_xml() {
   local runtime_dir="/run/user/$(id -u)"
 
   local gl_graphics=""
+  local graphics_device="<graphics type=\"spice\" autoport=\"yes\" listen=\"127.0.0.1\"><listen type=\"address\" address=\"127.0.0.1\" /></graphics>"
+  local spice_channel="<channel type=\"spicevmc\"><target type=\"virtio\" name=\"com.redhat.spice.0\" /><address type=\"virtio-serial\" controller=\"0\" bus=\"0\" port=\"2\" /></channel>"
   local video_device="<video><model type='virtio' heads='1' primary='yes'><acceleration accel3d='no'/></model></video>"
-  if [ -n "$RENDERNODE" ]; then
+  if [ -f "$IMAGE_DIR/use-vnc" ]; then
+    graphics_device="<graphics type=\"vnc\" port=\"-1\" autoport=\"yes\" listen=\"127.0.0.1\"><listen type=\"address\" address=\"127.0.0.1\" /></graphics>"
+    spice_channel=""
+    video_device="<video><model type='vga' heads='1' primary='yes'/></video>"
+    say "Using saved VNC/standard VGA display fallback."
+  elif [ -n "$RENDERNODE" ]; then
     gl_graphics="<graphics type='egl-headless'><gl rendernode='$RENDERNODE'/></graphics>"
     video_device="<video><model type='virtio' heads='1' primary='yes' device='virtio-vga-gl'><acceleration accel3d='yes'/></model></video>"
   fi
@@ -409,17 +520,12 @@ vm_synthesize_xml() {
       <target type="virtio" name="org.qemu.guest_agent.0" />
       <address type="virtio-serial" controller="0" bus="0" port="1" />
     </channel>
-    <channel type="spicevmc">
-      <target type="virtio" name="com.redhat.spice.0" />
-      <address type="virtio-serial" controller="0" bus="0" port="2" />
-    </channel>
+    $spice_channel
     <input type="tablet" bus="virtio" />
     <input type="keyboard" bus="virtio" />
     <input type="keyboard" bus="ps2" />
     <input type="mouse" bus="ps2" />
-    <graphics type="spice" autoport="yes" listen="127.0.0.1">
-      <listen type="address" address="127.0.0.1" />
-    </graphics>
+    $graphics_device
     $gl_graphics
     <audio id="1" type="pulseaudio" />
     <sound model="ich9"><audio id="1" /></sound>

@@ -125,7 +125,6 @@ detect_gpu() {
       break
     fi
 
-    [ -z "$RENDERNODE" ] && RENDERNODE="$node"
   done
 
   if [ -n "$RENDERNODE" ]; then

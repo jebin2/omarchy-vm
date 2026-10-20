@@ -4,6 +4,10 @@
 # ==============================================================================
 set -euo pipefail
 
+# QEMU, libvirt and virt-viewer must use the system graphics libraries, not
+# host-specific CUDA/EGL shims inherited from shells such as NoMachine.
+unset LD_PRELOAD LD_LIBRARY_PATH
+
 # Resolve symlinks (e.g. ~/.local/bin/omarchy) so lib/ is found next to the real script.
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 source "$SCRIPT_DIR/lib/common.sh"
@@ -255,6 +259,9 @@ case "$cmd" in
     ;;
   stop)
     vm_stop
+    ;;
+  _viewer-supervisor)
+    vm_viewer_supervisor
     ;;
   fit)
     # Internal: background screen fit scheduled by 'open'.

@@ -50,4 +50,4 @@ You can also start it from your app launcher: **Omarchy VM**.
 
 ## How it works
 
-The VM runs on KVM with virgl 3D acceleration and a SPICE display. While you go through the installer, the host prepares the new system through the installer's guest agent: it adds your SSH key, a temporary sudo grant and, for an encrypted disk, a one-time unlock key. After Reboot Now, it installs the guest tools (clipboard sync, cursor fix, screen fit) over SSH, then removes the temporary grant and key.
+The VM runs on KVM with virgl 3D acceleration and a SPICE display. If the SPICE viewer crashes or remains stuck during startup, the host switches the VM to VNC with standard VGA and reopens it; this fallback has no 3D acceleration. The host remembers a successful fallback across delete/reset, so later installs open directly with VNC. While you go through the installer, the host prepares the new system through the installer's guest agent: it adds your SSH key, a temporary sudo grant and, for an encrypted disk, a one-time unlock key. After Reboot Now, it installs the guest tools (clipboard sync, cursor fix, screen fit) over SSH, then removes the temporary grant and key.
