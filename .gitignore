@@ -1,4 +1,5 @@
 # Virtual disks & NVRAM state
+images/
 images/*.qcow2*
 images/*.fd*
 images/.guest_user
