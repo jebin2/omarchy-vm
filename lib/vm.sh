@@ -210,6 +210,28 @@ vm_open_viewer() {
   nohup "$ROOT_DIR/omarchy" _viewer-supervisor >/dev/null 2>&1 &
 }
 
+# On hybrid-GPU hosts, GStreamer's plugin scan can hang forever inside the
+# NVIDIA driver; spice-gtk waits on that scan and sits on "Connecting to
+# graphic server". Run the viewer on a private plugin set without the GPU
+# plugins (it decodes in software) and its own registry. Execs virt-viewer.
+vm_exec_viewer() {
+  local src="" d f dir="$IMAGE_DIR/gst-plugins"
+  for d in /usr/lib/gstreamer-1.0 /usr/lib64/gstreamer-1.0 /usr/lib/x86_64-linux-gnu/gstreamer-1.0; do
+    [ -d "$d" ] && { src="$d"; break; }
+  done
+  if [ -n "$src" ]; then
+    rm -rf "$dir" && mkdir -p "$dir"
+    for f in "$src"/*.so; do
+      case "${f##*/}" in
+        libgstnvcodec.so|libgstvulkan.so|libgstva.so|libgstvaapi.so|libgstv4l2codecs.so|libgstopengl.so) ;;
+        *) ln -s "$f" "$dir/" ;;
+      esac
+    done
+    export GST_PLUGIN_SYSTEM_PATH_1_0="$dir" GST_REGISTRY_1_0="$IMAGE_DIR/gst-registry.bin"
+  fi
+  exec env -u LD_PRELOAD -u LD_LIBRARY_PATH virt-viewer "$@"
+}
+
 vm_viewer_supervisor() {
   local viewer_log="$IMAGE_DIR/virt-viewer.log" status=0 viewer_pid state connected=0 i
   : > "$viewer_log"
@@ -218,10 +240,11 @@ vm_viewer_supervisor() {
   # emit them, so sending an already-VNC domain through that timeout would
   # close its working viewer after 30 seconds.
   if [ "$(vm_graphics_backend)" = vnc ]; then
-    exec env -u LD_PRELOAD -u LD_LIBRARY_PATH virt-viewer -c "$URI" -f -a "$DOMAIN" >>"$viewer_log" 2>&1
+    vm_exec_viewer -c "$URI" -f -a "$DOMAIN" >>"$viewer_log" 2>&1
   fi
 
-  env -u LD_PRELOAD -u LD_LIBRARY_PATH virt-viewer --debug --verbose -c "$URI" -f -a "$DOMAIN" >"$viewer_log" 2>&1 &
+  # --debug alone no longer prints g_debug lines; the render check below needs them.
+  G_MESSAGES_DEBUG=virt-viewer vm_exec_viewer --debug --verbose -c "$URI" -f -a "$DOMAIN" >"$viewer_log" 2>&1 &
   viewer_pid=$!
 
   # The viewer can remain alive on its "connecting" page after the SPICE
@@ -257,7 +280,7 @@ vm_viewer_supervisor() {
   [ "$(vm_graphics_backend)" = spice ] || return "$status"
   printf 'SPICE viewer exited with status %s; retrying with VNC and standard VGA.\n' "$status" >>"$viewer_log"
   vm_switch_to_vnc || die "Could not switch the VM display to VNC. See $viewer_log."
-  exec env -u LD_PRELOAD -u LD_LIBRARY_PATH virt-viewer -c "$URI" -f -a "$DOMAIN" >>"$viewer_log" 2>&1
+  vm_exec_viewer -c "$URI" -f -a "$DOMAIN" >>"$viewer_log" 2>&1
 }
 
 vm_graphics_backend() {
@@ -279,7 +302,8 @@ s,n=re.subn(graphics,lambda _:vnc,s,count=1,flags=re.S)
 assert n==1,"SPICE graphics block not found"
 s,n=re.subn(r"\s*<graphics\b(?=[^>]*\btype=[\x27\"]egl-headless[\x27\"])[^>]*>.*?</graphics>","",s,count=1,flags=re.S)
 assert n<=1,"Unexpected number of EGL graphics blocks"
-s,n=re.subn(r"\s*<channel\b(?=[^>]*\btype=[\x27\"]spicevmc[\x27\"])[^>]*>.*?</channel>","",s,count=1,flags=re.S)
+# Keep clipboard sharing: swap the SPICE channel for the QEMU vdagent, which works over VNC.
+s,n=re.subn(r"<channel\b(?=[^>]*\btype=[\x27\"]spicevmc[\x27\"])[^>]*>(.*?)</channel>",lambda m:"<channel type=\x27qemu-vdagent\x27><source><clipboard copypaste=\x27yes\x27/></source>"+m.group(1)+"</channel>",s,count=1,flags=re.S)
 assert n==1,"SPICE channel not found"
 video=r"<video>.*?</video>"
 def standard_vga(m):
@@ -333,8 +357,8 @@ vm_clipboard_status() {
   case "${1:-}" in -f|--follow) follow=1 ;; esac
 
   local chan
-  chan="$(virsh -c "$URI" dumpxml "$DOMAIN" | grep -A1 "channel type='spicevmc'" | grep -o "state='[a-z]*'" | cut -d"'" -f2 || true)"
-  echo "Host SPICE channel:  ${chan:-missing}"
+  chan="$(virsh -c "$URI" dumpxml "$DOMAIN" | grep -A4 -E "channel type='(spicevmc|qemu-vdagent)'" | grep -o "state='[a-z]*'" | cut -d"'" -f2 || true)"
+  echo "Host vdagent channel: ${chan:-missing}"
   pgrep -f "(^|/)virt-viewer -c .* -a $DOMAIN$" >/dev/null && echo "virt-viewer:         open" \
     || echo "virt-viewer:         not open (clipboard sharing needs it: omarchy open)"
 
@@ -440,7 +464,9 @@ vm_synthesize_xml() {
   local video_device="<video><model type='virtio' heads='1' primary='yes'><acceleration accel3d='no'/></model></video>"
   if [ -f "$IMAGE_DIR/use-vnc" ]; then
     graphics_device="<graphics type=\"vnc\" port=\"-1\" autoport=\"yes\" listen=\"127.0.0.1\"><listen type=\"address\" address=\"127.0.0.1\" /></graphics>"
-    spice_channel=""
+    # VNC has no SPICE channel; QEMU's built-in vdagent speaks the same
+    # protocol to the guest's spice-vdagent and relays clipboard over VNC.
+    spice_channel="<channel type=\"qemu-vdagent\"><source><clipboard copypaste=\"yes\" /></source><target type=\"virtio\" name=\"com.redhat.spice.0\" /><address type=\"virtio-serial\" controller=\"0\" bus=\"0\" port=\"2\" /></channel>"
     video_device="<video><model type='vga' heads='1' primary='yes'/></video>"
     say "Using saved VNC/standard VGA display fallback."
   elif [ -n "$RENDERNODE" ]; then
