@@ -27,6 +27,7 @@ The first run may ask for your sudo password to install a few packages, and it d
 | :--- | :--- |
 | `omarchy open` | Start Omarchy and open its window |
 | `omarchy stop` | Shut it down |
+| `omarchy repair` | Bring back copy-paste and the other VM tweaks after a reset inside Omarchy |
 | `omarchy reset` | Erase it and install again |
 | `omarchy delete` | Remove it completely |
 | `omarchy install` | Create it (first time only) |

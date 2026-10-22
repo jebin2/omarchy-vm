@@ -119,7 +119,8 @@ cleanup_provisioner() {
   [ -n "$SERVE_DIR" ] && rm -rf "$SERVE_DIR" || true
 }
 
-run_provisioner() {
+# Serve guest/setup.sh and its assets to the guest at 10.0.2.2:$PROVISION_PORT.
+start_provision_server() {
   say "Preparing provisioning assets..."
 
   # Stop any previous instance of our own provisioner
@@ -150,7 +151,10 @@ run_provisioner() {
 
   sleep 1
   kill -0 "$PROV_PID" 2>/dev/null || die "Could not bind provisioning server on port $PROVISION_PORT"
+}
 
+run_provisioner() {
+  start_provision_server
   vm_start
 
   # Hands-free installs run out of sight and the window opens once Omarchy is
@@ -220,6 +224,47 @@ run_provisioner() {
   fi
 }
 
+# Reinstall the guest tools (clipboard sync, cursor fix, SSH key) after the
+# guest lost them, e.g. to a reset done inside Omarchy. Runs setup over SSH when
+# the host key still works; otherwise the user pastes the setup line in the guest.
+cmd_repair() {
+  vm_defined || die "No Omarchy VM yet. Create one with: omarchy install"
+  detect_ssh_key
+  start_provision_server
+  vm_start
+  # Open the window now: an encrypted disk waits there for its password.
+  viewer_running || vm_open_viewer
+  local setup_cmd="bash <(curl -fsSL http://10.0.2.2:$PROVISION_PORT)"
+
+  say "Waiting for the guest to answer over SSH..."
+  local i ssh_ok=0
+  for i in $(seq 1 20); do
+    vm_guest_ssh true </dev/null >/dev/null 2>&1 && { ssh_ok=1; break; }
+    sleep 3
+  done
+
+  if [ "$ssh_ok" -eq 1 ]; then
+    # -t: sudo and omarchy update prompt on this terminal.
+    say "Running guest setup over SSH (enter your Omarchy password when sudo asks)..."
+    ssh -t -p "$SSH_PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+      -o LogLevel=ERROR "$(resolve_guest_user)@127.0.0.1" "bash -lc '$setup_cmd'" \
+      || die "Guest setup failed; see the output above."
+  else
+    warn "The guest does not accept the host SSH key (a reset inside Omarchy removes it)."
+    echo -e "\nOpen a terminal in Omarchy (${BOLD}Super + Enter${NC}) and run:"
+    echo -e "\n      ${BOLD}${YELLOW}$setup_cmd${NC}\n"
+    local before
+    before="$(stat -c %Y "$GUEST_USER_FILE" 2>/dev/null || echo 0)"
+    say "Waiting for the guest setup to finish (press Ctrl+C to cancel)..."
+    while [ "$(stat -c %Y "$GUEST_USER_FILE" 2>/dev/null || echo 0)" = "$before" ]; do
+      sleep 3
+    done
+  fi
+
+  viewer_running || vm_open_viewer
+  ok "Guest tools reinstalled. If copy-paste still fails, log out of Omarchy and back in."
+}
+
 show_usage() {
   cat <<EOF
 Usage: omarchy <command>
@@ -231,6 +276,8 @@ Commands:
                   Downloads the latest Omarchy ISO unless you pass one.
   open            Start the VM (if needed) and open its window
   stop            Shut the VM down cleanly
+  repair          Reinstall the guest tools (copy-paste, cursor fix, SSH key),
+                  e.g. after resetting or reinstalling from inside Omarchy
   reset [ISO]     Erase the VM and install Omarchy again from scratch
   delete          Erase the VM completely
 
@@ -265,6 +312,9 @@ case "$cmd" in
     ;;
   stop)
     vm_stop
+    ;;
+  repair)
+    cmd_repair
     ;;
   _viewer-supervisor)
     vm_viewer_supervisor
