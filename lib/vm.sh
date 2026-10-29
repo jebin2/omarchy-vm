@@ -125,7 +125,15 @@ PY
 }
 
 vm_close_viewer() {
+  # Stop the supervisor first: it would otherwise treat the killed viewer as a
+  # failed start and relaunch it (via the VNC fallback) while the VM reboots.
+  pkill -f "omarchy _viewer-supervisor" 2>/dev/null || true
   pkill -f "(^|/)virt-viewer -c .* -a $DOMAIN$" 2>/dev/null || true
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    pgrep -f "(^|/)virt-viewer -c .* -a $DOMAIN$" >/dev/null 2>&1 || return 0
+    sleep 0.2
+  done
 }
 
 vm_start() {

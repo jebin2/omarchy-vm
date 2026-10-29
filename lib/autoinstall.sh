@@ -206,6 +206,29 @@ guided_alive() {
   [ "$(date +%s)" -lt "$1" ] && vm_is_running
 }
 
+# In the live ISO: mount the installed system on /mnt (and its ESP on /mnt/boot)
+# if the installer already unmounted it. Opens the LUKS volume with the
+# installer's password when the disk is encrypted. Best effort.
+auto_remount_target() {
+  vm_agent_sh 'set -e
+    if ! mountpoint -q /mnt; then
+      dev=$(lsblk -rno PATH,FSTYPE | awk '"'"'$2 == "crypto_LUKS" { print $1; exit }'"'"')
+      if [ -n "$dev" ]; then
+        if [ ! -e /dev/mapper/root ]; then
+          jq -j ".encryption_password // empty" /root/user_credentials.json | cryptsetup open --key-file=- "$dev" root
+        fi
+        src=/dev/mapper/root
+      else
+        src=$(lsblk -rno PATH,FSTYPE | awk '"'"'$2 == "btrfs" { print $1; exit }'"'"')
+      fi
+      mount -o subvol=@ "$src" /mnt
+    fi
+    if ! mountpoint -q /mnt/boot; then
+      esp=$(lsblk -rno PATH,FSTYPE | awk '"'"'$2 == "vfat" { print $1; exit }'"'"')
+      mount "$esp" /mnt/boot
+    fi' >/dev/null 2>&1 || true
+}
+
 # Default install: the user goes through Omarchy's own
 # installer in the VM window. Meanwhile the host, as root in the live ISO via its
 # guest agent, hands the installer our SSH key and, once it finishes, seeds a
@@ -214,7 +237,7 @@ guided_alive() {
 # VM out of sight, runs setup, and opens the window on the finished desktop.
 auto_guided_install() {
   local deadline=$(( $(date +%s) + PROVISION_TIMEOUT )) seen_installer=0 user="" encrypted=""
-  local target_prepared=0
+  local target_prepared=0 gone=0
 
   echo -e "\n${BOLD}${GREEN}Go through the Omarchy installer in the VM window.${NC}"
   echo -e "When Omarchy shows ${BOLD}Reboot Now${NC}, click it. The host holds the reboot briefly while it prepares the first boot; the VM reopens when setup is done.\n"
@@ -295,12 +318,18 @@ OMARCHY_VM_SYSTEMCTL
         fi
         ok "Installing Omarchy${user:+ for $user}..."
       fi
+      gone=0
     elif [ "$seen_installer" -eq 1 ]; then
-      break
+      # The orchestrator can be absent for a moment between phases.
+      gone=$((gone + 1))
+      [ "$gone" -ge 20 ] && break
     fi
     sleep 0.5
   done
 
+  # The installer may have unmounted the target (and closed the LUKS volume) by
+  # now; mount it again so the first boot can be prepared.
+  vm_is_running && auto_remount_target
   if vm_is_running && vm_agent_sh 'mountpoint -q /mnt' >/dev/null 2>&1; then
     if [ -n "$user" ]; then
       # Seed the grant the hands-free path creates over SSH, plus a boot timer that
@@ -323,7 +352,7 @@ OMARCHY_VM_SYSTEMCTL
     target_prepared=1
   fi
   # Release the held reboot (if Reboot Now was already clicked, it goes through now).
-  vm_agent_sh 'touch /run/omarchy-vm-seed-done' >/dev/null 2>&1 || true
+  vm_agent_sh 'sync; touch /run/omarchy-vm-seed-done' >/dev/null 2>&1 || true
 
   if vm_is_running; then
     [ "$target_prepared" -eq 1 ] || warn "The VM rebooted before host setup could be prepared."
@@ -423,7 +452,10 @@ UNLOCK_SERIAL="omvmunlock"
 # normal udev by-id links are guaranteed to exist. The temporary raw key disk
 # is attached as the second virtio block device, so use its stable guest block
 # name directly for this one boot.
-UNLOCK_PARAM="cryptkey=/dev/vdb:0:64"
+UNLOCK_PARAM="cryptkey=/dev/vdb:0:64 rd.luks.key=/dev/vdb"
+# The systemd initrd (rd.luks.name=) ignores cryptkey=; it reads the key from the
+# device given by rd.luks.key, limited to the key's 64 bytes by this option.
+UNLOCK_OPT=",keyfile-size=64"
 
 # In the live ISO, with the new system still mounted: add a random one-time key
 # to the LUKS volume (authorized with the passphrase from the installer's
@@ -484,8 +516,14 @@ auto_seed_unlock_key() {
     printf '%s' \"\$pw\" | cryptsetup luksAddKey --batch-mode --key-file=- --pbkdf pbkdf2 --pbkdf-force-iterations 1000 \"\$dev\" /tmp/omvm.key
     rm -f /tmp/omvm.key
 
-    # The Omarchy installer always boots with Limine from /boot/limine.conf.
-    sed -i -E 's#^([[:space:]]*(kernel_)?cmdline:.*)\$#\\1 $UNLOCK_PARAM#' /mnt/boot/limine.conf
+    # The Omarchy installer always boots with Limine from /boot/limine.conf; give
+    # it a moment to write the file.
+    i=0
+    while [ \"\$i\" -lt 60 ] && ! grep -qs 'cmdline:' /mnt/boot/limine.conf; do
+      sleep 0.5
+      i=\$((i + 1))
+    done
+    sed -i -E 's#^([[:space:]]*(kernel_)?cmdline:.*)\$#\\1 $UNLOCK_PARAM#; s#(rd\\.luks\\.options=[^ ]*)#\\1$UNLOCK_OPT#' /mnt/boot/limine.conf
     grep -q '$UNLOCK_PARAM' /mnt/boot/limine.conf" "$stdin_data" >/dev/null 2>"$IMAGE_DIR/unlock.err" || rc=$?
 
   if [ "$rc" -ne 0 ]; then
@@ -517,7 +555,7 @@ set -e
 dev=\$(lsblk -rno PATH,FSTYPE | awk '\$2 == "crypto_LUKS" { print \$1; exit }')
 [ -n "\$dev" ] || dev=\$(blkid -t TYPE=crypto_LUKS -o device 2>/dev/null | head -1)
 [ -n "\$dev" ] && printf '%s' '$UNLOCK_KEY' | cryptsetup luksRemoveKey --batch-mode --key-file=- "\$dev" || true
-sed -i 's# $UNLOCK_PARAM##g' /boot/limine.conf
+sed -i 's# $UNLOCK_PARAM##g; s#$UNLOCK_OPT##g' /boot/limine.conf
 EOF
   local flags=(--config)
   vm_is_running && flags=(--live --config)
