@@ -173,10 +173,15 @@ detect_ssh_key() {
   ok "SSH Key: $PUBKEY"
 }
 
-# Newest ISO URL linked from omarchy.org (empty when offline or unparseable).
+# Newest x86 ISO URL linked from omarchy.org (empty when offline or unparseable).
+# Current releases are omarchy-X.Y.Z-x86.iso; older ones omit the architecture.
 latest_iso_url() {
-  curl -fsSL --max-time 15 https://omarchy.org/ 2>/dev/null \
-    | grep -oE 'https://iso\.omarchy\.org/omarchy-[0-9][0-9.]*\.iso' | sort -uV | tail -1 || true
+  local page urls x86
+  page="$(curl -fsSL --max-time 15 https://omarchy.org/ 2>/dev/null)" || return 0
+  urls="$(printf '%s\n' "$page" | grep -oE 'https://iso\.omarchy\.org/omarchy-[0-9][0-9.]*(-x86(_64)?)?\.iso' || true)"
+  [ -n "$urls" ] || return 0
+  x86="$(printf '%s\n' "$urls" | grep -E -- '-x86(_64)?\.iso$' || true)"
+  printf '%s\n' "${x86:-$urls}" | sort -uV | tail -1
 }
 
 # Check an ISO against its published .sha256 (skipped when it can't be fetched).
@@ -189,8 +194,8 @@ verify_iso() {
   [ "$have" = "$want" ]
 }
 
-# Sets ISO: the given path, else the latest release (downloaded once into the
-# repo), else the newest ISO already on disk when omarchy.org is unreachable.
+# Sets ISO: the given path, else the latest x86 release (downloaded once into
+# the repo), else the newest ISO already on disk when the lookup fails.
 detect_iso() {
   local custom="${1:-}" url name target
   ISO=""
@@ -205,8 +210,8 @@ detect_iso() {
   url="$(latest_iso_url)"
   if [ -z "$url" ]; then
     ISO="$(ls -v "$ROOT_DIR"/omarchy-*.iso 2>/dev/null | tail -1 || true)"
-    [ -n "$ISO" ] || die "Could not reach omarchy.org to find the latest ISO. Pass one: omarchy install /path/to/omarchy.iso"
-    warn "omarchy.org unreachable; using local $(basename "$ISO")."
+    [ -n "$ISO" ] || die "Could not find the latest ISO on omarchy.org. Pass one: omarchy install /path/to/omarchy.iso"
+    warn "Could not find a current ISO on omarchy.org; using local $(basename "$ISO")."
     return 0
   fi
 
